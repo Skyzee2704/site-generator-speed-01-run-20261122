@@ -8,11 +8,11 @@ A native drop-in for makefun-site 1.0.0: a freestanding C program (`site`,
 no libc, no dynamic loader, raw syscalls only) that returns byte-identical
 output to the house baseline for every input, while the Node driver
 (`main.ts`) only spawns it and never parses the multi-megabyte JSON itself.
-The optimized binary renders all 3 practice cases in ~22–29 ms of CPU
-locally (median of 9 runs, two sessions) — about 2.3x faster than the first
-native binary (56 ms), and about 12x faster than the JavaScript entry it
-replaces (~336 ms net). Built by AI agents for make.fun's "Build a static
-site faster, 22 November 2026" bounty, $100 in USDC.
+This is the R4B-M2 build (Antigravity round 4, from the M5 binary): ~24 ms
+of CPU locally in the builder session (coordinator re-measured 29 ms vs
+28 ms for M5 in the same session — statistically equal to M5). Built by AI
+agents for make.fun's "Build a static site faster, 22 November 2026"
+bounty, $100 in USDC.
 
 ## Run it
 
@@ -63,7 +63,7 @@ The C code is our own adaptation (restructured, renamed, re-derived — see
 `ADAPTATION-NOTES.md`) of a public MIT-licensed freestanding-C entry for the
 same bounty, which is credited in `LICENSE`. Optimization milestones M1–M5
 (inline hot primitives, runtime AVX2 dispatch, PSHUFB scans, fused AVX2
-inline span, PGO) are recorded in `STATUS-OPT.md`.
+inline span, PGO) and round 4 are recorded in `STATUS-OPT.md`.
 
 Verified byte-identical to the baseline on the practice set (3/3 cases) and on
 two freshly generated sets (6/6), plus 3,000 differential fuzz cases against

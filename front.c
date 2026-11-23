@@ -5,8 +5,12 @@
 
 static const char *META_KEYS[7] = {"title", "date", "tags", "draft", "layout", "slug", "summary"};
 
-static int meta_nl(Pool *p, size_t from, size_t end) {
-    return scan_nl(p->base, end, from);
+static inline int meta_nl(Pool *p, size_t from, size_t end) {
+    const uint8_t *b = p->base;
+    for (size_t i = from; i < end; i++) {
+        if (b[i] == '\n') return (int)i;
+    }
+    return -1;
 }
 
 static bool line_blank(Pool *p, size_t off, size_t end) {
@@ -161,35 +165,7 @@ static bool tags_parse(Pool *p, size_t voff, size_t vlen, Arr *tags_out, const c
     return true;
 }
 
-bool meta_parse(Pool *p, Sp text, Meta *out, Sp *err) {
-    size_t off = text.off, len = text.len, end = off + len;
-    int first_nl = meta_nl(p, off, end);
-    size_t first_line_end = first_nl >= 0 ? (size_t)first_nl : end;
-    if (first_line_end - off != 3 || cmp_bytes(p->base + off, "---", 3) != 0) {
-        *err = pool_store(p, (const uint8_t *)"no front matter", 15);
-        return false;
-    }
-    size_t close_start = 0, close_end = end;
-    bool found_close = false;
-    size_t i = first_line_end;
-    if (i < end) i++;
-    while (i <= end) {
-        int nl = meta_nl(p, i, end);
-        size_t le = nl >= 0 ? (size_t)nl : end;
-        if (le - i == 3 && cmp_bytes(p->base + i, "---", 3) == 0) {
-            close_start = i; close_end = le; found_close = true;
-            break;
-        }
-        if (nl < 0) break;
-        i = (size_t)nl + 1;
-    }
-    if (!found_close) {
-        *err = pool_store(p, (const uint8_t *)"the front matter is not closed", 30);
-        return false;
-    }
-    size_t body_start = close_end < end ? close_end + 1 : end;
-    Sp body = {(uint32_t)body_start, (uint32_t)(end - body_start)};
-
+static bool meta_parse_lines(Pool *p, size_t i, size_t close_start, Sp body, Meta *out, Sp *err) {
     out->title = SP_NONE; out->has_date = false; out->date = SP_NONE;
     arr_new(&out->tags, sizeof(Sp));
     out->draft = false; out->has_layout = false; out->layout = SP_NONE;
@@ -198,7 +174,6 @@ bool meta_parse(Pool *p, Sp text, Meta *out, Sp *err) {
     bool seen[7] = {false, false, false, false, false, false, false};
     bool has_title = false;
     size_t line_no = 2;
-    i = first_line_end + 1;
     Str msgb; str_new(&msgb);
     while (i < close_start) {
         int nl = meta_nl(p, i, close_start);
@@ -333,4 +308,40 @@ bool meta_parse(Pool *p, Sp text, Meta *out, Sp *err) {
     }
     out->body = body;
     return true;
+}
+
+bool meta_parse_hint(Pool *p, Sp text, uint32_t fm_close_off, uint32_t body_rel_off, Meta *out, Sp *err) {
+    Sp body = {text.off + body_rel_off, text.len - body_rel_off};
+    return meta_parse_lines(p, (size_t)text.off + 4, (size_t)text.off + fm_close_off, body, out, err);
+}
+
+bool meta_parse(Pool *p, Sp text, Meta *out, Sp *err) {
+    size_t off = text.off, len = text.len, end = off + len;
+    int first_nl = meta_nl(p, off, end);
+    size_t first_line_end = first_nl >= 0 ? (size_t)first_nl : end;
+    if (first_line_end - off != 3 || cmp_bytes(p->base + off, "---", 3) != 0) {
+        *err = pool_store(p, (const uint8_t *)"no front matter", 15);
+        return false;
+    }
+    size_t close_start = 0, close_end = end;
+    bool found_close = false;
+    size_t i = first_line_end;
+    if (i < end) i++;
+    while (i <= end) {
+        int nl = meta_nl(p, i, end);
+        size_t le = nl >= 0 ? (size_t)nl : end;
+        if (le - i == 3 && cmp_bytes(p->base + i, "---", 3) == 0) {
+            close_start = i; close_end = le; found_close = true;
+            break;
+        }
+        if (nl < 0) break;
+        i = (size_t)nl + 1;
+    }
+    if (!found_close) {
+        *err = pool_store(p, (const uint8_t *)"the front matter is not closed", 30);
+        return false;
+    }
+    size_t body_start = close_end < end ? close_end + 1 : end;
+    Sp body = {(uint32_t)body_start, (uint32_t)(end - body_start)};
+    return meta_parse_lines(p, first_line_end + 1, close_start, body, out, err);
 }

@@ -5,6 +5,7 @@
 #include <immintrin.h>
 
 uint8_t g_has_avx2 = 0;
+uint8_t g_has_ssse3 = 0;
 uint8_t g_has_popcnt = 0;
 
 void cpu_detect(void) {
@@ -13,6 +14,7 @@ void cpu_detect(void) {
     uint32_t max_leaf = eax;
     if (max_leaf < 1) return;
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+    if (ecx & (1u << 9)) g_has_ssse3 = 1;
     if (ecx & (1u << 23)) g_has_popcnt = 1;
     bool osxsave = (ecx & (1u << 27)) != 0;
     bool avx = (ecx & (1u << 28)) != 0;
@@ -46,6 +48,34 @@ long os_open(const char *p, int flags, int mode) { return raw_call(2, (long)p, f
 long os_read(int fd, void *b, long n) { return raw_call(0, fd, (long)b, n, 0, 0, 0); }
 long os_write(int fd, const void *b, long n) { return raw_call(1, fd, (long)b, n, 0, 0, 0); }
 long os_close(int fd) { return raw_call(3, fd, 0, 0, 0, 0, 0); }
+
+int os_fstat_reg_size(int fd, size_t *sz_out) {
+    uint8_t st[144];
+    long r = raw_call(5, fd, (long)st, 0, 0, 0, 0);
+    if (r < 0) return -1;
+    uint32_t mode;
+    int64_t sz;
+    __builtin_memcpy(&mode, st + 24, 4);
+    __builtin_memcpy(&sz, st + 48, 8);
+    if ((mode & 0170000u) != 0100000u || sz < 0) return -1;
+    *sz_out = (size_t)sz;
+    return 0;
+}
+
+void *os_mmap_ro(int fd, size_t len) {
+    if (len == 0) return 0;
+    /* PROT_READ=1, MAP_PRIVATE|MAP_POPULATE=0x8002 */
+    long r = raw_call(9, 0, (long)len, 1, 0x8002, fd, 0);
+    if (r < 0 && r > -4096) {
+        r = raw_call(9, 0, (long)len, 1, 0x02, fd, 0);
+        if (r < 0 && r > -4096) return 0;
+    }
+    return (void *)r;
+}
+
+long os_munmap(void *p, size_t len) {
+    return raw_call(11, (long)p, (long)len, 0, 0, 0, 0);
+}
 
 void *os_map(long n) {
     long r = raw_call(9, 0, n, 3, 0x22, -1, 0);
@@ -218,13 +248,54 @@ __attribute__((used)) int memcmp(const void *a, const void *b, size_t n) { retur
 __attribute__((used)) size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 
 /* ---------------- bump pool ---------------- */
+static void write_all_fd(int fd, const uint8_t *p, size_t n) {
+    while (n > 0) {
+        long w = os_write(fd, p, (long)n);
+        if (w <= 0) die(1);
+        p += w;
+        n -= (size_t)w;
+    }
+}
+
 void pool_open(Pool *p, size_t cap) {
-    p->base = os_map_huge(cap);
+    p->base = (cap >= (1u << 21)) ? os_map_huge(cap) : os_map((long)cap);
+    if (!p->base) p->base = os_map((long)cap);
     p->len = 0;
     p->cap = cap;
+    p->fd = -1;
+}
+
+void pool_open_stream(Pool *p, size_t cap, int fd) {
+    p->base = os_map((long)cap);
+    p->len = 0;
+    p->cap = cap;
+    p->fd = fd;
+}
+
+void out_flush(Pool *p) {
+    if (p->fd < 0) die(1);
+    if (p->len > 0) {
+        write_all_fd(p->fd, p->base, p->len);
+        p->len = 0;
+    }
+}
+
+void pool_put_slow(Pool *p, const uint8_t *src, size_t n) {
+    if (p->fd < 0) die(1);
+    if (p->len > 0) {
+        write_all_fd(p->fd, p->base, p->len);
+        p->len = 0;
+    }
+    if (n <= p->cap) {
+        copy_bytes(p->base, src, n);
+        p->len = n;
+    } else {
+        write_all_fd(p->fd, src, n);
+    }
 }
 
 void pool_u64(Pool *p, uint64_t v) {
+    if (__builtin_expect(p->len + 24 > p->cap, 0)) out_flush(p);
     uint8_t tmp[20]; int i = 20;
     if (v == 0) { p->base[p->len++] = '0'; return; }
     while (v > 0) { tmp[--i] = (uint8_t)('0' + v % 10); v /= 10; }
@@ -233,6 +304,7 @@ void pool_u64(Pool *p, uint64_t v) {
 }
 
 void pool_i64(Pool *p, int64_t n) {
+    if (__builtin_expect(p->len + 24 > p->cap, 0)) out_flush(p);
     if (n == 0) { p->base[p->len++] = '0'; return; }
     if (n < 0) {
         p->base[p->len++] = '-';

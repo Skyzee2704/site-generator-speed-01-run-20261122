@@ -145,3 +145,15 @@ M3 29 → M4 29–30 → M5 24 ms (driver session); coordinator re-measured M5 a
 2.3x faster than the first native binary. The SSE2-only fallback variant was
 also verified correct (9/9 + fuzz 3000) at 30 ms, so the entry stays correct
 and fast even on a CPU without AVX2.
+
+## Round 4 — R4B-M2 (Antigravity, 24 Nov 2026)
+
+Round 4 (two chunks, both killed by the 30-minute print timeout) produced
+M6, R4B-M1 and R4B-M2 from the M5 source. R4B-M1 (22 ms) has no source
+snapshot and is not submitted. R4B-M2 (24 ms local in the driver session;
+coordinator re-measured 29 ms vs M5's 28 ms in the same session —
+statistically equal to M5) is the clean candidate: its source snapshot
+(`src-m2-backup/`, 12 files + the unchanged `entry.S` startup stub) matches
+the binary, and it was verified byte-identical on practice 3/3 + two fresh
+sets 6/6 + 3,000 differential fuzz cases. It replaces the M5 entry
+(rank 31 @ 70,000 µs) as the counting submission.

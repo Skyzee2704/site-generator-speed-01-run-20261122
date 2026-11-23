@@ -262,12 +262,16 @@ Sp slug_unique(Pool *p, Sp slug, Set *taken) {
     }
 }
 
-static inline unsigned popcount16(uint16_t x) {
-    x = (uint16_t)((x & 0x5555u) + ((x >> 1) & 0x5555u));
-    x = (uint16_t)((x & 0x3333u) + ((x >> 2) & 0x3333u));
-    x = (uint16_t)((x & 0x0f0fu) + ((x >> 4) & 0x0f0fu));
-    x = (uint16_t)((x & 0x00ffu) + ((x >> 8) & 0x00ffu));
-    return x;
+static inline unsigned popcount64_swar(uint64_t x) {
+    x -= (x >> 1) & 0x5555555555555555ULL;
+    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+    x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
+    return (unsigned)((x * 0x0101010101010101ULL) >> 56);
+}
+
+__attribute__((target("popcnt")))
+static inline unsigned popcount64_hw(uint64_t x) {
+    return (unsigned)__builtin_popcountll(x);
 }
 
 __attribute__((target("avx2,popcnt")))
@@ -378,42 +382,86 @@ size_t word_count(const uint8_t *b, size_t n) {
     if (g_has_avx2 && g_has_popcnt && n >= 32) return word_count_avx2(b, n);
     size_t count = 0, i = 0;
     bool in_word = false;
-    /* SSE2 fast path: 16 bytes at a time while the chunk is all ASCII.
-     * A word starts at a non-whitespace byte whose predecessor is
-     * whitespace (or the start of input). Non-ASCII chunks fall back to
-     * the scalar loop for that chunk only, then SIMD resumes. */
+    __m128i vsp = _mm_set1_epi8(' ');
+    __m128i v8 = _mm_set1_epi8(8);
+    __m128i v14 = _mm_set1_epi8(14);
+    __m128i maskf0 = _mm_set1_epi8((char)0xf0);
+    __m128i ve0 = _mm_set1_epi8((char)0xe0);
+    __m128i vc2 = _mm_set1_epi8((char)0xc2);
+    while (i + 64 <= n) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(b + i + 16));
+        __m128i v2 = _mm_loadu_si128((const __m128i *)(b + i + 32));
+        __m128i v3 = _mm_loadu_si128((const __m128i *)(b + i + 48));
+        __m128i any_hi = _mm_or_si128(_mm_or_si128(v0, v1), _mm_or_si128(v2, v3));
+        if (__builtin_expect(_mm_movemask_epi8(any_hi) != 0, 0)) {
+            __m128i sp0 = _mm_or_si128(_mm_cmpeq_epi8(v0, vc2), _mm_cmpeq_epi8(_mm_and_si128(v0, maskf0), ve0));
+            __m128i sp1 = _mm_or_si128(_mm_cmpeq_epi8(v1, vc2), _mm_cmpeq_epi8(_mm_and_si128(v1, maskf0), ve0));
+            __m128i sp2 = _mm_or_si128(_mm_cmpeq_epi8(v2, vc2), _mm_cmpeq_epi8(_mm_and_si128(v2, maskf0), ve0));
+            __m128i sp3 = _mm_or_si128(_mm_cmpeq_epi8(v3, vc2), _mm_cmpeq_epi8(_mm_and_si128(v3, maskf0), ve0));
+            if (_mm_movemask_epi8(_mm_or_si128(_mm_or_si128(sp0, sp1), _mm_or_si128(sp2, sp3))) != 0) {
+                size_t end = i + 64;
+                while (i < end) {
+                    uint8_t c0 = b[i];
+                    if (c0 < 0x80) {
+                        if (ws_byte(c0)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else if ((c0 & 0xc0) == 0x80) {
+                        if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else {
+                        uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
+                        if (u_is_space(c)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i += m;
+                    }
+                }
+                continue;
+            }
+        }
+        __m128i w0 = _mm_or_si128(_mm_cmpeq_epi8(v0, vsp), _mm_and_si128(_mm_cmpgt_epi8(v0, v8), _mm_cmpgt_epi8(v14, v0)));
+        __m128i w1 = _mm_or_si128(_mm_cmpeq_epi8(v1, vsp), _mm_and_si128(_mm_cmpgt_epi8(v1, v8), _mm_cmpgt_epi8(v14, v1)));
+        __m128i w2 = _mm_or_si128(_mm_cmpeq_epi8(v2, vsp), _mm_and_si128(_mm_cmpgt_epi8(v2, v8), _mm_cmpgt_epi8(v14, v2)));
+        __m128i w3 = _mm_or_si128(_mm_cmpeq_epi8(v3, vsp), _mm_and_si128(_mm_cmpgt_epi8(v3, v8), _mm_cmpgt_epi8(v14, v3)));
+        uint64_t ws = (uint64_t)(uint16_t)_mm_movemask_epi8(w0)
+            | ((uint64_t)(uint16_t)_mm_movemask_epi8(w1) << 16)
+            | ((uint64_t)(uint16_t)_mm_movemask_epi8(w2) << 32)
+            | ((uint64_t)(uint16_t)_mm_movemask_epi8(w3) << 48);
+        uint64_t starts = (~ws) & ((ws << 1) | (in_word ? 0ULL : 1ULL));
+        count += g_has_popcnt ? popcount64_hw(starts) : popcount64_swar(starts);
+        in_word = (ws >> 63) == 0;
+        i += 64;
+    }
     while (i + 16 <= n) {
         __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
-        if (_mm_movemask_epi8(v) != 0) {
-            size_t end = i + 16;
-            while (i < end) {
-                uint8_t c0 = b[i];
-                if (c0 < 0x80) {
-                    if (ws_byte(c0)) in_word = false;
-                    else if (!in_word) { in_word = true; count++; }
-                    i++;
-                } else {
-                    uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
-                    if (u_is_space(c)) in_word = false;
-                    else if (!in_word) { in_word = true; count++; }
-                    i += m;
+        if (__builtin_expect(_mm_movemask_epi8(v) != 0, 0)) {
+            __m128i sp = _mm_or_si128(_mm_cmpeq_epi8(v, vc2), _mm_cmpeq_epi8(_mm_and_si128(v, maskf0), ve0));
+            if (_mm_movemask_epi8(sp) != 0) {
+                size_t end = i + 16;
+                while (i < end) {
+                    uint8_t c0 = b[i];
+                    if (c0 < 0x80) {
+                        if (ws_byte(c0)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else if ((c0 & 0xc0) == 0x80) {
+                        if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else {
+                        uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
+                        if (u_is_space(c)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i += m;
+                    }
                 }
+                continue;
             }
-            continue;
         }
-        __m128i m = _mm_setzero_si128();
-        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8(' ')));
-        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8('\t')));
-        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8('\n')));
-        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8('\v')));
-        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8('\f')));
-        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, _mm_set1_epi8('\r')));
-        uint16_t ws = (uint16_t)_mm_movemask_epi8(m);
-        uint16_t nonws = (uint16_t)~ws;
-        /* bit j set iff byte j is non-ws and byte j-1 is ws; bit 0 uses
-         * the carried state (1 when not inside a word). */
-        uint16_t prev = (uint16_t)((ws << 1) | (in_word ? 0 : 1));
-        count += (size_t)popcount16((uint16_t)(nonws & prev));
+        __m128i w = _mm_or_si128(_mm_cmpeq_epi8(v, vsp), _mm_and_si128(_mm_cmpgt_epi8(v, v8), _mm_cmpgt_epi8(v14, v)));
+        uint16_t ws = (uint16_t)_mm_movemask_epi8(w);
+        uint64_t starts = (uint16_t)((uint16_t)(~ws) & (uint16_t)((ws << 1) | (in_word ? 0u : 1u)));
+        count += g_has_popcnt ? popcount64_hw(starts) : popcount64_swar(starts);
         in_word = (ws & 0x8000u) == 0;
         i += 16;
     }
@@ -422,6 +470,9 @@ size_t word_count(const uint8_t *b, size_t n) {
         if (c0 < 0x80) {
             if (ws_byte(c0)) in_word = false;
             else if (!in_word) { in_word = true; count++; }
+            i++;
+        } else if ((c0 & 0xc0) == 0x80) {
+            if (!in_word) { in_word = true; count++; }
             i++;
         } else {
             uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
@@ -573,7 +624,23 @@ static void html_json_escape_into_avx2(Pool *p, const uint8_t *bytes, size_t n) 
 
 void html_json_escape_into(Pool *p, const uint8_t *bytes, size_t n) {
     if (n == 0) return;
-    if (g_has_avx2) { html_json_escape_into_avx2(p, bytes, n); return; }
+    if (g_has_avx2) {
+        if (__builtin_expect(p->fd >= 0 && p->len + n * 6 + 64 > p->cap, 0)) {
+            out_flush(p);
+            size_t chunk = (p->cap - 64) / 6;
+            size_t off = 0;
+            while (off < n) {
+                size_t step = n - off;
+                if (step > chunk) step = chunk;
+                html_json_escape_into_avx2(p, bytes + off, step);
+                off += step;
+                if (off < n) out_flush(p);
+            }
+            return;
+        }
+        html_json_escape_into_avx2(p, bytes, n);
+        return;
+    }
     static const char *HEX = "0123456789abcdef";
     size_t i = 0;
     while (i < n) {

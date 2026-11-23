@@ -259,7 +259,7 @@ typedef struct { uint8_t kind; Sp span; bool raw; } Tok;
 static bool lex_tokens(Pool *p, Sp name, Sp src, Arr *toks_out, Sp *err) {
     arr_new(toks_out, sizeof(Tok));
     size_t off = src.off, len = src.len, end = off + len;
-    Str text; str_new(&text);
+    static Str text; str_clear(&text);
     size_t i = off;
     static const uint8_t brace[1] = {'{'};
     while (i < end) {
@@ -621,21 +621,32 @@ static void dep_collect_ref(Pool *p, Ref *rf, Arr *deps, bool *bad_loop) {
     }
 }
 
-static void dep_collect_nodes(Pool *p, Arr *nodes, Arr *deps, bool *bad_loop) {
+static bool ref_uses_card_md(Ref *rf) {
+    if (rf->kind != REF_SCOPE && rf->kind != REF_DYN) return false;
+    for (uint8_t i = 0; i < rf->chain_len; i++) {
+        if (rf->chain[i] == F_EXCERPT || rf->chain[i] == F_READING_MINUTES) return true;
+    }
+    return false;
+}
+
+static void dep_collect_nodes(Pool *p, Arr *nodes, Arr *deps, bool *bad_loop, bool *uses_card_md) {
     for (size_t i = 0; i < nodes->len; i++) {
         Node *s = arr_at(nodes, i);
         switch (s->kind) {
             case ND_VAR:
                 dep_collect_ref(p, &s->u.var.ref, deps, bad_loop);
+                if (ref_uses_card_md(&s->u.var.ref)) *uses_card_md = true;
                 break;
             case ND_IF:
                 dep_collect_ref(p, &s->u.nif.ref, deps, bad_loop);
-                dep_collect_nodes(p, &s->u.nif.then_nodes, deps, bad_loop);
-                dep_collect_nodes(p, &s->u.nif.else_nodes, deps, bad_loop);
+                if (ref_uses_card_md(&s->u.nif.ref)) *uses_card_md = true;
+                dep_collect_nodes(p, &s->u.nif.then_nodes, deps, bad_loop, uses_card_md);
+                dep_collect_nodes(p, &s->u.nif.else_nodes, deps, bad_loop, uses_card_md);
                 break;
             case ND_FOR:
                 dep_collect_ref(p, &s->u.nfor.ref, deps, bad_loop);
-                dep_collect_nodes(p, &s->u.nfor.body, deps, bad_loop);
+                if (ref_uses_card_md(&s->u.nfor.ref)) *uses_card_md = true;
+                dep_collect_nodes(p, &s->u.nfor.body, deps, bad_loop, uses_card_md);
                 break;
             default:
                 break;
@@ -664,7 +675,7 @@ static void include_resolve_all(Pool *p, Arr *templates, Arr *nodes) {
     }
 }
 
-static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, bool *any_bad) {
+static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, bool *any_bad, bool *any_card_md) {
     bool changed = false;
     for (size_t i = 0; i < nodes->len; i++) {
         Node *s = arr_at(nodes, i);
@@ -673,6 +684,7 @@ static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, b
             if (k >= 0) {
                 Tpl *u = arr_at(templates, (size_t)k);
                 if (!u->cacheable) *any_bad = true;
+                if (u->uses_card_md) *any_card_md = true;
                 size_t before = deps->len;
                 for (size_t j = 0; j < u->needs.len; j++) {
                     TplNeed *d = arr_at(&u->needs, j);
@@ -681,10 +693,10 @@ static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, b
                 if (deps->len != before) changed = true;
             }
         } else if (s->kind == ND_IF) {
-            if (dep_union_includes(p, templates, &s->u.nif.then_nodes, deps, any_bad)) changed = true;
-            if (dep_union_includes(p, templates, &s->u.nif.else_nodes, deps, any_bad)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nif.then_nodes, deps, any_bad, any_card_md)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nif.else_nodes, deps, any_bad, any_card_md)) changed = true;
         } else if (s->kind == ND_FOR) {
-            if (dep_union_includes(p, templates, &s->u.nfor.body, deps, any_bad)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nfor.body, deps, any_bad, any_card_md)) changed = true;
         }
     }
     return changed;
@@ -695,17 +707,20 @@ void tpl_analyze(Pool *p, Arr *templates) {
         Tpl *t = arr_at(templates, k);
         arr_new(&t->needs, sizeof(TplNeed));
         t->cacheable = 1;
-        bool bad = false;
-        dep_collect_nodes(p, &t->nodes, &t->needs, &bad);
+        t->uses_card_md = 0;
+        bool bad = false, ucmd = false;
+        dep_collect_nodes(p, &t->nodes, &t->needs, &bad, &ucmd);
         if (bad) t->cacheable = 0;
+        if (ucmd) t->uses_card_md = 1;
     }
     for (int iter = 0; iter < 16; iter++) {
         bool changed = false;
         for (size_t k = 0; k < templates->len; k++) {
             Tpl *t = arr_at(templates, k);
-            bool bad = false;
-            if (dep_union_includes(p, templates, &t->nodes, &t->needs, &bad)) changed = true;
+            bool bad = false, ucmd = false;
+            if (dep_union_includes(p, templates, &t->nodes, &t->needs, &bad, &ucmd)) changed = true;
             if (bad && t->cacheable) { t->cacheable = 0; changed = true; }
+            if (ucmd && !t->uses_card_md) { t->uses_card_md = 1; changed = true; }
         }
         if (!changed) break;
     }
@@ -915,6 +930,8 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                 Val v = tpl_eval(c, scopes, *nscopes, &seg->u.var.ref);
                 if (__builtin_expect(v.kind == K_STR_JSON, 1)) {
                     pool_put(out, c->pool->base + v.v.s.off, v.v.s.len);
+                } else if (v.kind == K_CUR_HTML) {
+                    pool_put(out, c->cur_html + v.v.s.off, v.v.s.len);
                 } else {
                     val_write(c, v, out, !seg->raw, scratch);
                 }
@@ -952,14 +969,17 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                 if (depth < INCLUDE_DEPTH && seg->u.ninc.tpl_idx >= 0) {
                     size_t k = (size_t)seg->u.ninc.tpl_idx;
                     Tpl *t = arr_at(templates, k);
+                    Pool *cp = c->cache_pool;
                     if (t->cache_mode == 1) {
                         Sp *slot = &c->tpl_global[k * INCLUDE_DEPTH + depth];
                         if (__builtin_expect(slot->off != 0xffffffffu, 1)) {
-                            pool_copy(out, *slot);
+                            pool_put(out, cp->base + slot->off, slot->len);
                         } else {
-                            uint32_t start = pool_mark(out);
-                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, depth + 1);
-                            *slot = pool_span(out, start);
+                            uint32_t start = pool_mark(cp);
+                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, cp, scratch, depth + 1);
+                            Sp span = pool_span(cp, start);
+                            *slot = span;
+                            if (out != cp) pool_put(out, cp->base + span.off, span.len);
                         }
                         break;
                     }
@@ -968,11 +988,13 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                         if (__builtin_expect(dv.kind == K_OBJ && dv.akind == O_CARD && dv.idx < c->pages.len, 1)) {
                             Sp *slot = &c->tpl_card_cache[(size_t)t->card_slot * c->pages.len + dv.idx];
                             if (__builtin_expect(slot->off != 0xffffffffu, 1)) {
-                                pool_copy(out, *slot);
+                                pool_put(out, cp->base + slot->off, slot->len);
                             } else {
-                                uint32_t start = pool_mark(out);
-                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, depth + 1);
-                                *slot = pool_span(out, start);
+                                uint32_t start = pool_mark(cp);
+                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, cp, scratch, depth + 1);
+                                Sp span = pool_span(cp, start);
+                                *slot = span;
+                                if (out != cp) pool_put(out, cp->base + span.off, span.len);
                             }
                             break;
                         }
@@ -997,15 +1019,16 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                                 bool eq = true;
                                 for (uint8_t di = 0; di < nk; di++) if (!val_equal(e->keys[di], keys[di])) { eq = false; break; }
                                 if (eq) {
-                                    pool_copy(out, e->bytes); hit = true; break;
+                                    pool_put(out, cp->base + e->bytes.off, e->bytes.len); hit = true; break;
                                 }
                             }
                             slot = (slot + 1) & mask;
                         }
                         if (!hit) {
-                            uint32_t start = pool_mark(out);
-                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, depth + 1);
-                            Sp span = pool_span(out, start);
+                            uint32_t start = pool_mark(cp);
+                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, cp, scratch, depth + 1);
+                            Sp span = pool_span(cp, start);
+                            if (out != cp) pool_put(out, cp->base + span.off, span.len);
                             if (c->tpl_entries.len < 4096) {
                                 TplHit *e = arr_slot(&c->tpl_entries, c->pool);
                                 e->hash = h; e->tpl_idx = (uint32_t)k; e->depth = (uint8_t)(depth + 1);

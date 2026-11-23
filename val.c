@@ -156,6 +156,7 @@ size_t ctx_arr_len(Ctx *c, uint8_t kind, uint32_t idx) {
             return r->len;
         }
         case A_TOC: {
+            if (c->lazy_md) return c->cur_toc ? c->cur_toc->len : 0;
             Range *r = arr_at(&c->toc_arrays, idx);
             return r->len;
         }
@@ -178,6 +179,7 @@ Val ctx_arr_elem(Ctx *c, uint8_t kind, uint32_t idx, size_t i) {
             return val_obj(O_TAGREF, r->start + (uint32_t)i);
         }
         case A_TOC: {
+            if (c->lazy_md) return val_obj(O_TOC, (uint32_t)i);
             Range *r = arr_at(&c->toc_arrays, idx);
             return val_obj(O_TOC, r->start + (uint32_t)i);
         }
@@ -205,7 +207,9 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
                     case F_READING_MINUTES: return val_int(p->reading_minutes);
                     case F_TAGS: return val_arr(A_TAGREFS, p->tags);
                     case F_SLUG: return val_str_json(p->slug);
-                    case F_CONTENT: return c->md_pre_json ? val_str_json(p->html) : val_str(p->html);
+                    case F_CONTENT:
+                        if (c->lazy_md) return val_cur_html((Sp){0, c->cur_html_len}, c->md_pre_json);
+                        return c->md_pre_json ? val_str_json(p->html) : val_str(p->html);
                     case F_TOC: return val_arr(A_TOC, p->toc);
                     case F_NEWER: return p->newer >= 0 ? val_obj(O_LINK, (uint32_t)p->newer) : val_null();
                     case F_OLDER: return p->older >= 0 ? val_obj(O_LINK, (uint32_t)p->older) : val_null();
@@ -258,11 +262,13 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
                 }
             }
             case O_TOC: {
-                Toc *t = arr_at(&c->toc_store, v.idx);
+                Toc *t = c->lazy_md ? (Toc *)arr_at(c->cur_toc, v.idx) : (Toc *)arr_at(&c->toc_store, v.idx);
                 switch (f) {
                     case F_LEVEL: return val_int(t->level);
                     case F_ID: return val_str_json(t->id);
-                    case F_HTML: return c->md_pre_json ? val_str_json(t->html) : val_str(t->html);
+                    case F_HTML:
+                        if (c->lazy_md) return val_cur_html(t->html, c->md_pre_json);
+                        return c->md_pre_json ? val_str_json(t->html) : val_str(t->html);
                     default: return val_void();
                 }
             }
@@ -313,7 +319,7 @@ bool val_true(Ctx *c, Val v) {
         case K_VOID: case K_NULL: return false;
         case K_BOOL: return v.v.n != 0;
         case K_INT: return v.v.n != 0;
-        case K_STR: case K_STR_JSON: return v.v.s.len > 0;
+        case K_STR: case K_STR_JSON: case K_CUR_HTML: case K_CUR_HTML_RAW: return v.v.s.len > 0;
         case K_OBJ: case K_LOOP: return true;
         default: return false;
     }
@@ -323,6 +329,9 @@ void val_text(Ctx *c, Val v, Str *scratch) {
     switch (v.kind) {
         case K_STR: case K_STR_JSON:
             str_add(scratch, pool_at(c->pool, v.v.s), v.v.s.len);
+            return;
+        case K_CUR_HTML: case K_CUR_HTML_RAW:
+            str_add(scratch, c->cur_html + v.v.s.off, v.v.s.len);
             return;
         case K_INT:
             str_i64(scratch, v.v.n);
@@ -348,6 +357,15 @@ void val_write(Ctx *c, Val v, Pool *out, bool esc, Str *scratch) {
         case K_STR_JSON:
             pool_put(out, pool_at(c->pool, v.v.s), v.v.s.len);
             return;
+        case K_CUR_HTML:
+            pool_put(out, c->cur_html + v.v.s.off, v.v.s.len);
+            return;
+        case K_CUR_HTML_RAW: {
+            const uint8_t *b = c->cur_html + v.v.s.off;
+            if (esc) html_json_escape_into(out, b, v.v.s.len);
+            else json_escape_into(out, b, v.v.s.len);
+            return;
+        }
         case K_STR: {
             const uint8_t *b = pool_at(c->pool, v.v.s);
             if (esc) html_json_escape_into(out, b, v.v.s.len);
