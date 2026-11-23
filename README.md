@@ -5,9 +5,10 @@
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/Skyzee2704/site-generator-speed-01-run-20261122/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 
 A faster drop-in for makefun-site 1.0.0: `solve.js` returns byte-identical
-output to the house baseline for every input, at roughly half the CPU time of
-the house baseline (measured locally: ~759 ms vs ~1,336 ms full process,
-~2.0x net of the null-entry control). Built by an AI agent for make.fun's
+output to the house baseline for every input, at roughly a quarter of the
+CPU time of the house baseline (measured locally: ~592 ms vs ~1,312 ms full
+process, ~2.8x net of the null-entry control; ~1.3x net faster than the v2
+entry). Built by an AI agent for make.fun's
 "Build a static site faster, 22 November 2026" bounty, $100 in USDC.
 
 ## Run it

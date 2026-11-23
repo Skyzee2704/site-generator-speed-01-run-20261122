@@ -1,3 +1,5 @@
+import { setFlagsFromString } from 'node:v8';
+setFlagsFromString('--no-opt');
 // solve.js — a fast, from-scratch reimplementation of the makefun-site 1.0.0 static
 // site generator dialect (spec: kit baselines/makefun-site/vendor/makefun-site/README.md).
 // The reference implementation was read to pin down exact behaviour, but no vendor code
@@ -356,8 +358,8 @@ function truthy(v) {
  * atomic comma expression, so sharing it is safe.
  */
 function genGet(path) {
-  if (path.length === 1) return `$sc.${path[0]}`;
-  const parts = [`$t=$sc.${path[0]}`];
+  if (path.length === 1) return `$S.${path[0]}`;
+  const parts = [`$t=$S.${path[0]}`];
   for (let k = 1; k < path.length; k++) {
     parts.push(`$t=($t!==null&&typeof $t==='object'?$t.${path[k]}:undefined)`);
   }
@@ -365,20 +367,37 @@ function genGet(path) {
   return `(${parts.join(',')})`;
 }
 
-/** The nodes' rendering as flat generated code (no tree walk at render time). */
-function genNodes(nodes) {
+/**
+ * The nodes' rendering as flat generated code (no tree walk at render time).
+ * `bound` is the set of loop-variable names bound by enclosing fors at this point.
+ * An include of a case-global template (its output depends only on site/tags/recent,
+ * see templateGlobal) is served from the per-case GLOB cache when no loop variable is
+ * bound here (so no caller loop state can leak into it) and the whole include chain
+ * fits under the depth cap (depth + depthNeeded <= 8, so the cached full rendering
+ * equals what a fresh render would produce); otherwise it falls back to a plain call.
+ */
+function genNodes(nodes, bound, globalSet, depthNeeded) {
   let s = '';
   for (const n of nodes) {
     if (n.kind === 'text') s += `out.push(${JSON.stringify(n.text)});`;
     else if (n.kind === 'var') s += `out.push(esc(txt(${genGet(n.path)})));`;
     else if (n.kind === 'raw') s += `out.push(txt(${genGet(n.path)}));`;
     else if (n.kind === 'if') {
-      s += `if(tru(${genGet(n.path)})!==${n.not}){${genNodes(n.then)}}`;
-      if (n.else !== null) s += `else{${genNodes(n.else)}}`;
+      s += `if(tru(${genGet(n.path)})!==${n.not}){${genNodes(n.then, bound, globalSet, depthNeeded)}}`;
+      if (n.else !== null) s += `else{${genNodes(n.else, bound, globalSet, depthNeeded)}}`;
     } else if (n.kind === 'for') {
-      s += `{let $x=${genGet(n.path)};if(Array.isArray($x)){for(let $k=0;$k<$x.length;$k++){const $p=$sc;$sc=Object.create($sc);$sc.${n.name}=$x[$k];const $l=Object.create(null);$l.index=$k+1;$l.first=$k===0;$l.last=$k===$x.length-1;$l.length=$x.length;$sc.loop=$l;${genNodes(n.body)}$sc=$p;}}}`;
+      const bound2 = new Set(bound);
+      bound2.add(n.name);
+      bound2.add('loop');
+      s += `{let $x=${genGet(n.path)};if(Array.isArray($x)){for(let $k=0;$k<$x.length;$k++){const $sv=$S.${n.name};$S.${n.name}=$x[$k];const $lv=$S.loop;const $l=Object.create(null);$l.index=$k+1;$l.first=$k===0;$l.last=$k===$x.length-1;$l.length=$x.length;$S.loop=$l;${genNodes(n.body, bound2, globalSet, depthNeeded)}$S.${n.name}=$sv;$S.loop=$lv;}}}`;
     } else if (n.kind === 'include') {
-      s += `{const $f=T.get(${JSON.stringify(n.name)});if($f!==undefined&&depth<${INCLUDE_DEPTH})$f($sc,T,out,depth+1,esc,txt,tru);}`;
+      const nm = JSON.stringify(n.name);
+      if (globalSet.has(n.name) && bound.size === 0) {
+        const nn = depthNeeded.get(n.name) || 1;
+        s += `{if(depth+${nn}<=8){let $g=GLOB.get(${nm});if($g===undefined){const $o=[];const $f=T.get(${nm});if($f!==undefined){$f($S,T,$o,depth+1,esc,txt,tru,GLOB);$g=$o.join('');GLOB.set(${nm},$g);}}if($g!==undefined)out.push($g);}else{const $f=T.get(${nm});if($f!==undefined&&depth<${INCLUDE_DEPTH})$f($S,T,out,depth+1,esc,txt,tru,GLOB);}}`;
+      } else {
+        s += `{const $f=T.get(${nm});if($f!==undefined&&depth<${INCLUDE_DEPTH})$f($S,T,out,depth+1,esc,txt,tru,GLOB);}`;
+      }
     }
   }
   return s;
@@ -389,8 +408,8 @@ function genNodes(nodes) {
  * `fn(scope, T, out, depth, esc, txt, tru)`: `scope` is the prototype-chained scope
  * object, `T` the map of compiled templates (for includes), `out` the output array.
  */
-function compileTemplate(nodes) {
-  return new Function('scope', 'T', 'out', 'depth', 'esc', 'txt', 'tru', `let $sc=scope;let $t;\n${genNodes(nodes)}`);
+function compileTemplate(nodes, globalSet = new Set(), depthNeeded = new Map()) {
+  return new Function('S', 'T', 'out', 'depth', 'esc', 'txt', 'tru', 'GLOB', `let $S=S;let $t;\n${genNodes(nodes, new Set(), globalSet, depthNeeded)}`);
 }
 
 // ---------------------------------------------------------------- Markdown
@@ -474,17 +493,18 @@ function findSingleStar(s, from) {
 }
 
 /**
- * `s` rendered inline; `env.link(target)` is a link's href. A single regex scan
- * (run in C++) finds the next interesting character; plain runs between them are
- * pushed whole, so the common no-markup text costs one scan and no per-character work.
+ * `s` rendered inline, appended to `out`; `env.link(target)` is a link's href. A single
+ * regex scan (run in C++) finds the next interesting character; plain runs between them
+ * are pushed whole, so the common no-markup text costs one scan and no per-character work.
  * INLINE_RE is shared: inline() always resets its lastIndex after each step (and at
  * entry), so the recursive calls for nested emphasis/links cannot disturb the caller.
+ * Appending to the caller's array (instead of building and joining one per call) saves
+ * one array + one join per inline call, of which there are tens of thousands.
  */
 const INLINE_RE = /[\\`*\[]|[&<>"']/g;
-function inline(s, env) {
+function inline(s, env, out) {
   const re = INLINE_RE;
   re.lastIndex = 0;
-  const out = [];
   let i = 0;
   let m;
   while ((m = re.exec(s)) !== null) {
@@ -514,7 +534,9 @@ function inline(s, env) {
       if (s[j + 1] === '*') {
         const k = findUnescaped(s, '**', j + 2);
         if (k > j + 2) {
-          out.push('<strong>', inline(s.slice(j + 2, k), env), '</strong>');
+          out.push('<strong>');
+          inline(s.slice(j + 2, k), env, out);
+          out.push('</strong>');
           i = k + 2;
         } else {
           out.push('**');
@@ -523,7 +545,9 @@ function inline(s, env) {
       } else {
         const k = findSingleStar(s, j + 1);
         if (k > j + 1) {
-          out.push('<em>', inline(s.slice(j + 1, k), env), '</em>');
+          out.push('<em>');
+          inline(s.slice(j + 1, k), env, out);
+          out.push('</em>');
           i = k + 1;
         } else {
           out.push('*');
@@ -535,7 +559,9 @@ function inline(s, env) {
       const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !/\s/.test(target)) {
-        out.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(j + 1, k), env), '</a>');
+        out.push('<a href="', escapeHtml(env.link(target)), '">');
+        inline(s.slice(j + 1, k), env, out);
+        out.push('</a>');
         i = mm + 1;
       } else {
         out.push('[');
@@ -548,7 +574,6 @@ function inline(s, env) {
     re.lastIndex = i;
   }
   if (i < s.length) out.push(s.slice(i));
-  return out.join('');
 }
 
 /**
@@ -592,8 +617,12 @@ function renderMarkdown(src, env) {
       const heading = headingOf(line);
       if (heading !== null) {
         const id = uniqueSlug(slugify(heading.text), ids);
-        const html = inline(heading.text, env);
-        out.push(`<h${heading.depth} id="${id}">`, html, `</h${heading.depth}>\n`);
+        out.push(`<h${heading.depth} id="${id}">`);
+        const hs = out.length;
+        inline(heading.text, env, out);
+        let html = '';
+        if (heading.depth === 2 || heading.depth === 3) html = out.slice(hs).join('');
+        out.push(`</h${heading.depth}>\n`);
         if (heading.depth === 2 || heading.depth === 3) toc.push(np({ level: heading.depth, id, html }));
         i++;
         continue;
@@ -613,7 +642,11 @@ function renderMarkdown(src, env) {
         if (t !== '') ls.push(t);
       }
       if (ls.length === 0) out.push('<blockquote>\n</blockquote>\n');
-      else out.push('<blockquote>\n<p>', inline(ls.join('\n'), env), '</p>\n</blockquote>\n');
+      else {
+        out.push('<blockquote>\n<p>');
+        inline(ls.join('\n'), env, out);
+        out.push('</p>\n</blockquote>\n');
+      }
       continue;
     }
     // A list: a bullet only starts with '-' or '*', an ordered item only with a digit.
@@ -638,18 +671,100 @@ function renderMarkdown(src, env) {
       }
       const tag = isOrdered ? 'ol' : 'ul';
       out.push(isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`, '\n');
-      for (let q = 0; q < items.length; q++) out.push('<li>', inline(items[q], env), '</li>\n');
+      for (let q = 0; q < items.length; q++) {
+        out.push('<li>');
+        inline(items[q], env, out);
+        out.push('</li>\n');
+      }
       out.push(`</${tag}>\n`);
       continue;
     }
     const body = [trimLine(line)];
     i++;
     while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = inline(body.join('\n'), env);
-    if (excerpt === null) excerpt = html;
-    out.push('<p>', html, '</p>\n');
+    out.push('<p>');
+    const ps = out.length;
+    inline(body.join('\n'), env, out);
+    if (excerpt === null) excerpt = out.slice(ps).join('');
+    out.push('</p>\n');
   }
   return { html: out.join(''), toc, excerpt: excerpt ?? '' };
+}
+
+
+// ---------------------------------------------------------------- template analysis
+
+/** The scope roots that are the same for every render of a case. */
+const GLOBAL_ROOTS = new Set(['site', 'tags', 'recent']);
+
+/** Walk `nodes` with `env` (loop-var name -> true when its array is case-global). */
+function walkTemplate(nodes, env, trees, visiting) {
+  let ok = true;
+  const check = (path) => {
+    const r = path[0];
+    if (env.has(r)) return env.get(r);
+    return GLOBAL_ROOTS.has(r);
+  };
+  for (const n of nodes) {
+    if (n.kind === 'text') continue;
+    if (n.kind === 'var' || n.kind === 'raw') { if (!check(n.path)) ok = false; }
+    else if (n.kind === 'if') {
+      if (!check(n.path)) ok = false;
+      if (!walkTemplate(n.then, env, trees, visiting).ok) ok = false;
+      if (n.else !== null && !walkTemplate(n.else, env, trees, visiting).ok) ok = false;
+    } else if (n.kind === 'for') {
+      const arrGlobal = check(n.path);
+      if (!arrGlobal) ok = false;
+      const env2 = new Map(env);
+      env2.set(n.name, arrGlobal);
+      env2.set('loop', arrGlobal);
+      if (!walkTemplate(n.body, env2, trees, visiting).ok) ok = false;
+    } else if (n.kind === 'include') {
+      if (!classifyTemplate(n.name, env, trees, visiting).ok) ok = false;
+    }
+  }
+  return { ok };
+}
+
+/** Whether template `name` reads only case-global data (under `env`); a cycle is not global. */
+function classifyTemplate(name, env, trees, visiting) {
+  if (visiting.has(name)) return { ok: false };
+  const nodes = trees.get(name);
+  if (nodes === undefined) return { ok: true };
+  visiting.add(name);
+  const r = walkTemplate(nodes, env, trees, visiting);
+  visiting.delete(name);
+  return r;
+}
+
+/** The longest include chain starting at `name` (1 = a leaf); a cycle is 99. */
+function templateDepth(name, trees, visiting) {
+  if (visiting.has(name)) return 99;
+  const nodes = trees.get(name);
+  if (nodes === undefined) return 0;
+  visiting.add(name);
+  let m = 1;
+  const go = (ns) => {
+    for (const n of ns) {
+      if (n.kind === 'include') m = Math.max(m, 1 + templateDepth(n.name, trees, visiting));
+      else if (n.kind === 'for') go(n.body);
+      else if (n.kind === 'if') { go(n.then); if (n.else) go(n.else); }
+    }
+  };
+  go(nodes);
+  visiting.delete(name);
+  return m;
+}
+
+/** The set of templates whose output is the same for every render of the case, and each one's include depth. */
+function analyzeTemplates(trees) {
+  const globalSet = new Set();
+  const depthNeeded = new Map();
+  for (const name of trees.keys()) {
+    if (classifyTemplate(name, new Map(), trees, new Set()).ok) globalSet.add(name);
+    depthNeeded.set(name, templateDepth(name, trees, new Set()));
+  }
+  return { globalSet, depthNeeded };
 }
 
 // ---------------------------------------------------------------- the build
@@ -663,19 +778,23 @@ const RESERVED = ['posts', 'tags', 'page'];
 /** One site's output tree: path -> text. */
 function build(input) {
   const templates = new Map();
+  const trees = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
+      trees.set(name, parseTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  const { globalSet, depthNeeded } = analyzeTemplates(trees);
+  for (const [name, nodes] of trees) templates.set(name, compileTemplate(nodes, globalSet, depthNeeded));
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
     templates,
+    glob: new Map(),
     sources: [],
     statics: [],
     bySource: new Map(),
@@ -746,19 +865,30 @@ function build(input) {
   // 4. Each body's Markdown, its links resolved to the pages and static files they name.
   const staticPaths = new Set(b.statics.map((f) => f.path));
   const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+  const linkCache = new Map();
   for (const s of b.sources) {
     const dir = dirOf(s.path);
     const env = {
       link: (target) => {
         if (SCHEME_RE.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+        const ck = `${dir}\0${target}`;
+        const hit = linkCache.get(ck);
+        if (hit !== undefined) {
+          if (hit.broken) b.broken.add(`broken-link ${s.path} -> ${target}`);
+          return hit.href;
+        }
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
         const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
-        b.broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
+        let href = target;
+        let broken = false;
+        if (path !== null && b.bySource.has(path)) href = `${b.bySource.get(path).url}${frag}`;
+        else if (path !== null && staticPaths.has(path)) href = `${b.base}/${path}${frag}`;
+        else if (rel !== '') broken = true;
+        if (broken) b.broken.add(`broken-link ${s.path} -> ${target}`);
+        linkCache.set(ck, { href, broken });
+        return href;
       },
     };
     const md = renderMarkdown(s.body, env);
@@ -808,33 +938,29 @@ function build(input) {
   b.tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
   // 7. Every page through its layout, the index pages and the tag pages through theirs.
-  /** A page's link record as templates read it. */
+  /** One view object per source: the card fields lists read AND the page fields layouts read, built once (no spread, no second object). */
   const linkOf = (s) => (s === null ? null : np({ title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) }));
-  /** A post's card, as lists show it. */
-  const cardOf = (s) => np({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => np({ name: t.name, slug: t.slug, url: t.url })),
-  });
-  /** A page as its layout reads it. */
-  const pageOf = (s) => np({
-    ...(b.cards.get(s) ?? cardOf(s)),
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc,
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  });
-  b.cards = new Map(b.posts.map((p) => [p, cardOf(p)]));
+  for (const s of b.sources) {
+    s.view = np({
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+      summary: s.data.summary ?? '',
+      excerpt: s.excerpt,
+      reading_minutes: s.post ? Math.max(1, Math.ceil(wordsOf(s.body) / 200)) : 1,
+      tags: s.tagRefs.map((t) => np({ name: t.name, slug: t.slug, url: t.url })),
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
+    });
+  }
   const site = np({ title: b.input.site.title, base_url: b.base });
   const allTags = b.tags.map((t) => np({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
-  const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
+  const recent = b.posts.slice(0, b.input.site.recent).map((p) => p.view);
   // One shared base scope per case ({site, tags, recent}); each render chains off it.
   const baseScope = Object.create(null);
   baseScope.site = site;
@@ -843,25 +969,28 @@ function build(input) {
   const render = (name, vars) => {
     const fn = b.templates.get(name);
     if (fn === undefined) return null;
-    const scope = Object.create(baseScope);
-    for (const k of Object.keys(vars)) scope[k] = vars[k];
+    const S = Object.create(null);
+    S.site = site;
+    S.tags = allTags;
+    S.recent = recent;
+    for (const k of Object.keys(vars)) S[k] = vars[k];
     const out = [];
-    fn(scope, b.templates, out, 0, escapeHtml, textOf, truthy);
+    fn(S, b.templates, out, 0, escapeHtml, textOf, truthy, b.glob);
     return out.join('');
   };
-  for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
+  for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: s.view });
   const per = b.input.site.per_page;
   const pages = Math.max(1, Math.ceil(b.posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${b.base}/` : `${b.base}/page/${k}/`);
   for (let k = 1; k <= pages; k++) {
     const html = render('index', {
-      posts: b.posts.slice((k - 1) * per, k * per).map((p) => b.cards.get(p)),
+      posts: b.posts.slice((k - 1) * per, k * per).map((p) => p.view),
       pager: np({ number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) }),
     });
     if (html !== null) b.output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
   }
   /** A tag as templates read it (its posts as cards). */
-  const tagOf = (t) => np({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => b.cards.get(p)) });
+  const tagOf = (t) => np({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => p.view) });
   for (const t of b.tags) {
     const html = render('tag', { tag: tagOf(t) });
     if (html !== null) b.output[`tags/${t.slug}/index.html`] = html;
