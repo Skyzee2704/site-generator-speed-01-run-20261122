@@ -215,9 +215,23 @@ bool meta_parse(Pool *p, Sp text, Meta *out, Sp *err) {
             }
             const uint8_t *key = p->base + koff;
             int ki = -1;
-            for (int k = 0; k < 7; k++) {
-                size_t kl = 0; while (META_KEYS[k][kl]) kl++;
-                if (kl == klen && cmp_bytes(META_KEYS[k], key, klen) == 0) { ki = k; break; }
+            switch (klen) {
+                case 4:
+                    if (eq_bytes(key, "date", 4)) ki = 1;
+                    else if (eq_bytes(key, "tags", 4)) ki = 2;
+                    else if (eq_bytes(key, "slug", 4)) ki = 5;
+                    break;
+                case 5:
+                    if (eq_bytes(key, "title", 5)) ki = 0;
+                    else if (eq_bytes(key, "draft", 5)) ki = 3;
+                    break;
+                case 6:
+                    if (eq_bytes(key, "layout", 6)) ki = 4;
+                    break;
+                case 7:
+                    if (eq_bytes(key, "summary", 7)) ki = 6;
+                    break;
+                default: break;
             }
             if (ki < 0) {
                 uint32_t st = pool_mark(p);

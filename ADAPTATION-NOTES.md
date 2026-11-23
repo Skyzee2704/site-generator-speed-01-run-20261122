@@ -120,3 +120,28 @@ Produces `./site` (91,464 B, ELF 64-bit LSB, statically linked, stripped).
 md5 (post-fix build): `9576bfb071d449d7e03121072b56687f`.
 Source: 4,824 lines of C (12 files + 2 headers), + `main.ts` (18) +
 `solve.js` (26).
+
+## Optimization M1–M5 (Antigravity, 23–24 Nov 2026)
+
+The adapted binary was optimized in five milestones by Antigravity (agy),
+working from the adapted source above. All milestones kept the output
+byte-identical (practice 3/3 + two fresh sets 6/6 + 3,000 differential fuzz
+cases vs the vendor, zero mismatches).
+
+- M1 — inline hot primitives (`arr_at`, `pool_put`, `pool_copy`, `str_c`,
+  `str_add`, `copy_bytes`, `cmp_bytes`) in `zg.h`; `first_bit` while-loop
+  replaced with `__builtin_ctz`; `-flto`.
+- M2 — runtime CPUID detection (`has_avx2`, `has_ssse3`, `has_popcnt`) for
+  fast AVX2 `memcpy`/`memcmp` and SIMD scans, with a safe SSE2 fallback.
+- M3 — AVX2 PSHUFB nibble-table scans and Markdown fast paths (inline_span,
+  html_esc, json_esc, scan_nl, word_count with popcnt).
+- M4 — fused AVX2 speculative-store `inline_span_json` and direct
+  JSON-escaped Markdown emission; AVX2 32-byte `parse_string_escaped`.
+- M5 — PGO (`-fprofile-generate` / `-fprofile-use`) and micro-tuning.
+
+Timing (binary alone, local, median of 9): base 56 ms → M1 41 → M2 38 →
+M3 29 → M4 29–30 → M5 24 ms (driver session); coordinator re-measured M5 at
+22 and 29 ms in two sessions, base at 53 ms in the same session — about
+2.3x faster than the first native binary. The SSE2-only fallback variant was
+also verified correct (9/9 + fuzz 3000) at 30 ms, so the entry stays correct
+and fast even on a CPU without AVX2.

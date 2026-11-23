@@ -148,57 +148,55 @@ typedef struct { Sp binder; uint8_t elem_ty; } ForBinder;
 
 /* Follow the remaining segments' field types from `ty`; fill the ref's
  * chain. Any missing field makes the whole ref Undef. */
-static bool chain_walk(Pool *p, uint8_t ty, const uint8_t *segs, size_t nsegs,
+static bool chain_walk(uint8_t ty, const uint8_t *segs, size_t nsegs,
                        const size_t *offs, const size_t *lens, Ref *ref) {
-    Arr *chain = &ref->chain;
     for (size_t k = 0; k < nsegs; k++) {
         int f = field_id(segs + offs[k], lens[k]);
-        if (f < 0) return false;
+        if (f < 0 || ref->chain_len >= 15) return false;
         if (ty == TY_VOID) {
-            uint8_t *slot_f = arr_slot(chain, p);
-            *slot_f = (uint8_t)f;
+            ref->chain[ref->chain_len++] = (uint8_t)f;
             continue;
         }
         uint8_t next = ty_field(ty, (uint8_t)f);
         if (next == TY_VOID) return false;
-        uint8_t *slot_f = arr_slot(chain, p);
-        *slot_f = (uint8_t)f;
+        ref->chain[ref->chain_len++] = (uint8_t)f;
         ty = next;
     }
     return true;
 }
 
-/* Split a path (already validated) into dot segments. Returns count. */
+/* Split a path (already validated) into dot segments. Returns count (capped at 16). */
 static size_t path_split(const uint8_t *b, size_t n, size_t *offs, size_t *lens) {
     size_t cnt = 0, s = 0;
     for (size_t i = 0; i <= n; i++) {
         if (i == n || b[i] == '.') {
-            offs[cnt] = s; lens[cnt] = i - s; cnt++;
+            if (cnt < 16) { offs[cnt] = s; lens[cnt] = i - s; }
+            cnt++;
             s = i + 1;
         }
     }
     return cnt;
 }
 
-/* Resolve a path's segments to a (Ref, Ty). `pool` is used for the
- * chain vecs and Dyn names; chain vecs are pool-allocated. */
+/* Resolve a path's segments to a (Ref, Ty). */
 static void slot_resolve(Pool *p, Arr *for_stack, const uint8_t *path, size_t n,
                          Ref *ref_out, uint8_t *ty_out) {
     size_t offs[16], lens[16];
     size_t nseg = path_split(path, n, offs, lens);
+    ref_out->kind = REF_VOID;
+    ref_out->root_field = 0; ref_out->offset = 0; ref_out->is_loop = 0;
+    ref_out->chain_len = 0;
+    ref_out->name = SP_NONE;
+    if (nseg > 16) { *ty_out = TY_VOID; return; }
     const uint8_t *first = path + offs[0];
     size_t flen = lens[0];
-    ref_out->kind = REF_VOID;
-    ref_out->root_field = 0; ref_out->offset = 0; ref_out->is_loop = false;
-    ref_out->name = SP_NONE;
-    arr_new(&ref_out->chain, sizeof(uint8_t));
     int rf = rootfield_id(first, flen);
     if (rf >= 0) {
         uint8_t ty = rootfield_ty((uint8_t)rf);
         ref_out->kind = REF_ROOT;
         ref_out->root_field = (uint8_t)rf;
         if (nseg == 1) { *ty_out = ty; return; }
-        if (chain_walk(p, ty, path, nseg - 1, offs + 1, lens + 1, ref_out)) { *ty_out = ty; return; }
+        if (chain_walk(ty, path, nseg - 1, offs + 1, lens + 1, ref_out)) { *ty_out = ty; return; }
         ref_out->kind = REF_VOID;
         *ty_out = TY_VOID;
         return;
@@ -206,10 +204,10 @@ static void slot_resolve(Pool *p, Arr *for_stack, const uint8_t *path, size_t n,
     if (flen == 4 && cmp_bytes(first, "loop", 4) == 0 && for_stack->len > 0) {
         ref_out->kind = REF_SCOPE;
         ref_out->offset = 0;
-        ref_out->is_loop = true;
+        ref_out->is_loop = 1;
         ref_out->name = pool_store(p, (const uint8_t *)"loop", 4);
         if (nseg == 1) { *ty_out = TY_LOOP; return; }
-        if (chain_walk(p, TY_LOOP, path, nseg - 1, offs + 1, lens + 1, ref_out)) { *ty_out = TY_LOOP; return; }
+        if (chain_walk(TY_LOOP, path, nseg - 1, offs + 1, lens + 1, ref_out)) { *ty_out = TY_LOOP; return; }
         ref_out->kind = REF_VOID;
         *ty_out = TY_VOID;
         return;
@@ -220,10 +218,10 @@ static void slot_resolve(Pool *p, Arr *for_stack, const uint8_t *path, size_t n,
         if (bn && fb->binder.len == flen && cmp_bytes(bn, first, flen) == 0) {
             ref_out->kind = REF_SCOPE;
             ref_out->offset = (uint8_t)(for_stack->len - 1 - q);
-            ref_out->is_loop = false;
+            ref_out->is_loop = 0;
             ref_out->name = fb->binder;
             if (nseg == 1) { *ty_out = fb->elem_ty; return; }
-            if (chain_walk(p, fb->elem_ty, path, nseg - 1, offs + 1, lens + 1, ref_out)) { *ty_out = fb->elem_ty; return; }
+            if (chain_walk(fb->elem_ty, path, nseg - 1, offs + 1, lens + 1, ref_out)) { *ty_out = fb->elem_ty; return; }
             ref_out->kind = REF_VOID;
             *ty_out = TY_VOID;
             return;
@@ -234,13 +232,12 @@ static void slot_resolve(Pool *p, Arr *for_stack, const uint8_t *path, size_t n,
     ref_out->name = pool_store(p, first, flen);
     for (size_t k = 1; k < nseg; k++) {
         int f = field_id(path + offs[k], lens[k]);
-        if (f < 0) {
+        if (f < 0 || ref_out->chain_len >= 15) {
             ref_out->kind = REF_VOID;
             *ty_out = TY_VOID;
             return;
         }
-        uint8_t *slot_f = arr_slot(&ref_out->chain, p);
-        *slot_f = (uint8_t)f;
+        ref_out->chain[ref_out->chain_len++] = (uint8_t)f;
     }
     *ty_out = TY_VOID;
 }
@@ -443,18 +440,7 @@ static const char *frame_kind_name(uint8_t kind) {
 }
 
 static void node_init(Node *s) {
-    s->kind = 0; s->text = SP_NONE;
-    s->ref.kind = REF_VOID; s->ref.root_field = 0;
-    s->ref.offset = 0; s->ref.is_loop = false; s->ref.name = SP_NONE;
-    arr_new(&s->ref.chain, sizeof(uint8_t));
-    s->raw = false; s->neg = false;
-    arr_new(&s->then_nodes, sizeof(Node));
-    arr_new(&s->else_nodes, sizeof(Node));
-    s->has_else = false;
-    s->binder = SP_NONE;
-    arr_new(&s->body, sizeof(Node));
-    s->name = SP_NONE;
-    s->tpl_idx = -1;
+    fill_bytes(s, 0, sizeof(Node));
 }
 
 bool tpl_parse(Pool *p, Sp name, Sp src, Arr *nodes_out, Sp *err) {
@@ -473,7 +459,7 @@ bool tpl_parse(Pool *p, Sp name, Sp src, Arr *nodes_out, Sp *err) {
         if (tok->kind == TK_TEXT) {
             Node *s = arr_slot(frame_body_mut(top), p);
             node_init(s);
-            s->kind = ND_TEXT; s->text = tok->span;
+            s->kind = ND_TEXT; s->u.text = tok->span;
             continue;
         }
         if (tok->kind == TK_VAR) {
@@ -487,7 +473,7 @@ bool tpl_parse(Pool *p, Sp name, Sp src, Arr *nodes_out, Sp *err) {
             slot_resolve(p, &for_stack, path, n, &ref, &ty);
             Node *s = arr_slot(frame_body_mut(top), p);
             node_init(s);
-            s->kind = ND_VAR; s->ref = ref; s->raw = tok->raw;
+            s->kind = ND_VAR; s->u.var.ref = ref; s->raw = tok->raw ? 1 : 0;
             continue;
         }
         /* Tag. */
@@ -561,13 +547,13 @@ bool tpl_parse(Pool *p, Sp name, Sp src, Arr *nodes_out, Sp *err) {
             Node *s = arr_slot(frame_body_mut(arr_at(&stack, stack.len - 1)), p);
             node_init(s);
             if (is_for) {
-                s->kind = ND_FOR; s->binder = done.binder; s->ref = done.list;
-                s->body = done.body;
+                s->kind = ND_FOR; s->u.nfor.binder = done.binder; s->u.nfor.ref = done.list;
+                s->u.nfor.body = done.body;
             } else {
-                s->kind = ND_IF; s->ref = done.slot; s->neg = done.not;
-                s->then_nodes = done.then_nodes;
-                s->else_nodes = done.else_nodes;
-                s->has_else = done.has_else;
+                s->kind = ND_IF; s->u.nif.ref = done.slot; s->neg = done.not ? 1 : 0;
+                s->u.nif.then_nodes = done.then_nodes;
+                s->u.nif.else_nodes = done.else_nodes;
+                s->has_else = done.has_else ? 1 : 0;
             }
             continue;
         }
@@ -576,7 +562,7 @@ bool tpl_parse(Pool *p, Sp name, Sp src, Arr *nodes_out, Sp *err) {
             Sp name_s = pool_store(p, tag + io, il);
             Node *s = arr_slot(frame_body_mut(top), p);
             node_init(s);
-            s->kind = ND_INCLUDE; s->name = name_s;
+            s->kind = ND_INCLUDE; s->u.ninc.name = name_s; s->u.ninc.tpl_idx = -1;
             continue;
         }
         Str msg; str_new(&msg);
@@ -640,16 +626,16 @@ static void dep_collect_nodes(Pool *p, Arr *nodes, Arr *deps, bool *bad_loop) {
         Node *s = arr_at(nodes, i);
         switch (s->kind) {
             case ND_VAR:
-                dep_collect_ref(p, &s->ref, deps, bad_loop);
+                dep_collect_ref(p, &s->u.var.ref, deps, bad_loop);
                 break;
             case ND_IF:
-                dep_collect_ref(p, &s->ref, deps, bad_loop);
-                dep_collect_nodes(p, &s->then_nodes, deps, bad_loop);
-                dep_collect_nodes(p, &s->else_nodes, deps, bad_loop);
+                dep_collect_ref(p, &s->u.nif.ref, deps, bad_loop);
+                dep_collect_nodes(p, &s->u.nif.then_nodes, deps, bad_loop);
+                dep_collect_nodes(p, &s->u.nif.else_nodes, deps, bad_loop);
                 break;
             case ND_FOR:
-                dep_collect_ref(p, &s->ref, deps, bad_loop);
-                dep_collect_nodes(p, &s->body, deps, bad_loop);
+                dep_collect_ref(p, &s->u.nfor.ref, deps, bad_loop);
+                dep_collect_nodes(p, &s->u.nfor.body, deps, bad_loop);
                 break;
             default:
                 break;
@@ -665,30 +651,25 @@ static int tpl_find_name(Pool *p, Arr *templates, Sp name) {
     return -1;
 }
 
-/* Resolve every {% include %} to its template index once, at compile
- * time, so rendering does a direct array access instead of a linear
- * name scan per include. Missing includes stay -1 (render nothing),
- * exactly like a scan that finds nothing. */
 static void include_resolve_all(Pool *p, Arr *templates, Arr *nodes) {
     for (size_t i = 0; i < nodes->len; i++) {
         Node *s = arr_at(nodes, i);
-        if (s->kind == ND_INCLUDE) s->tpl_idx = tpl_find_name(p, templates, s->name);
+        if (s->kind == ND_INCLUDE) s->u.ninc.tpl_idx = tpl_find_name(p, templates, s->u.ninc.name);
         else if (s->kind == ND_IF) {
-            include_resolve_all(p, templates, &s->then_nodes);
-            include_resolve_all(p, templates, &s->else_nodes);
+            include_resolve_all(p, templates, &s->u.nif.then_nodes);
+            include_resolve_all(p, templates, &s->u.nif.else_nodes);
         } else if (s->kind == ND_FOR) {
-            include_resolve_all(p, templates, &s->body);
+            include_resolve_all(p, templates, &s->u.nfor.body);
         }
     }
 }
 
-/* Union the deps of every template included (directly) by `nodes`. */
 static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, bool *any_bad) {
     bool changed = false;
     for (size_t i = 0; i < nodes->len; i++) {
         Node *s = arr_at(nodes, i);
         if (s->kind == ND_INCLUDE) {
-            int k = tpl_find_name(p, templates, s->name);
+            int k = tpl_find_name(p, templates, s->u.ninc.name);
             if (k >= 0) {
                 Tpl *u = arr_at(templates, (size_t)k);
                 if (!u->cacheable) *any_bad = true;
@@ -700,10 +681,10 @@ static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, b
                 if (deps->len != before) changed = true;
             }
         } else if (s->kind == ND_IF) {
-            if (dep_union_includes(p, templates, &s->then_nodes, deps, any_bad)) changed = true;
-            if (dep_union_includes(p, templates, &s->else_nodes, deps, any_bad)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nif.then_nodes, deps, any_bad)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nif.else_nodes, deps, any_bad)) changed = true;
         } else if (s->kind == ND_FOR) {
-            if (dep_union_includes(p, templates, &s->body, deps, any_bad)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nfor.body, deps, any_bad)) changed = true;
         }
     }
     return changed;
@@ -718,7 +699,6 @@ void tpl_analyze(Pool *p, Arr *templates) {
         dep_collect_nodes(p, &t->nodes, &t->needs, &bad);
         if (bad) t->cacheable = 0;
     }
-    /* Fixpoint over the include graph (handles cycles; depth <= 8). */
     for (int iter = 0; iter < 16; iter++) {
         bool changed = false;
         for (size_t k = 0; k < templates->len; k++) {
@@ -729,20 +709,36 @@ void tpl_analyze(Pool *p, Arr *templates) {
         }
         if (!changed) break;
     }
+    uint8_t next_card_slot = 0;
     for (size_t k = 0; k < templates->len; k++) {
         Tpl *t = arr_at(templates, k);
         if (t->needs.len > 8) t->cacheable = 0;
-        /* Storable: an entry can only ever hit again when its key does not
-         * contain a per-page value. Templates that read the current page,
-         * tag, posts array or pager get a fresh unique key on every page,
-         * so storing them only burns entry slots. Site/tags/recent are
-         * global, and dynamic (caller) values do repeat across the index
-         * and tag pages that render the same card. */
         t->storable = 1;
+        uint8_t ndyn = 0;
+        Sp dyn_name = SP_NONE;
         for (size_t j = 0; j < t->needs.len; j++) {
             TplNeed *d = arr_at(&t->needs, j);
-            if (d->kind == 1 && d->root_field != RF_SITE && d->root_field != RF_TAGS
-                && d->root_field != RF_RECENT) { t->storable = 0; break; }
+            if (d->kind == 1) {
+                if (d->root_field != RF_SITE && d->root_field != RF_TAGS
+                    && d->root_field != RF_RECENT) { t->storable = 0; break; }
+            } else {
+                ndyn++;
+                dyn_name = d->name;
+            }
+        }
+        t->cache_mode = 0;
+        t->card_slot = 0;
+        t->dyn_name = SP_NONE;
+        if (t->cacheable && t->storable) {
+            if (ndyn == 0) {
+                t->cache_mode = 1; /* Global: depends only on (tpl_idx, depth) */
+            } else if (ndyn == 1 && next_card_slot < 8) {
+                t->cache_mode = 2; /* 1 dyn dep: O(1) fast path for O_CARD at depth==0 */
+                t->card_slot = next_card_slot++;
+                t->dyn_name = dyn_name;
+            } else {
+                t->cache_mode = 3;
+            }
         }
     }
     for (size_t k = 0; k < templates->len; k++) {
@@ -751,52 +747,92 @@ void tpl_analyze(Pool *p, Arr *templates) {
     }
 }
 
-static Val dep_value(Ctx *c, Scope *scopes, size_t nscopes, TplNeed *d) {
-    if (d->kind == 1) return root_val(scopes, d->root_field);
-    const uint8_t *nm = pool_at(c->pool, d->name);
+static bool nodes_allow_pre_json_md(Arr *nodes) {
+    for (size_t i = 0; i < nodes->len; i++) {
+        Node *s = arr_at(nodes, i);
+        if (s->kind == ND_VAR && !s->raw && s->u.var.ref.chain_len > 0) {
+            uint8_t last = s->u.var.ref.chain[s->u.var.ref.chain_len - 1];
+            if (last == F_CONTENT || last == F_EXCERPT || last == F_HTML) return false;
+        } else if (s->kind == ND_IF) {
+            if (!nodes_allow_pre_json_md(&s->u.nif.then_nodes)) return false;
+            if (!nodes_allow_pre_json_md(&s->u.nif.else_nodes)) return false;
+        } else if (s->kind == ND_FOR) {
+            if (!nodes_allow_pre_json_md(&s->u.nfor.body)) return false;
+        }
+    }
+    return true;
+}
+
+bool tpl_can_pre_json_md(Arr *templates) {
+    for (size_t k = 0; k < templates->len; k++) {
+        Tpl *t = arr_at(templates, k);
+        if (!nodes_allow_pre_json_md(&t->nodes)) return false;
+    }
+    return true;
+}
+
+static inline Val dep_value_dyn(Ctx *c, Scope *scopes, size_t nscopes, Sp name) {
+    const uint8_t *nm = pool_at(c->pool, name);
     for (size_t fi = nscopes; fi-- > 0;) {
         Scope *fr = &scopes[fi];
         if (!fr->is_root) {
-            const uint8_t *bn = pool_at(c->pool, fr->name);
-            if (fr->name.len == d->name.len && cmp_bytes(bn, nm, d->name.len) == 0) return fr->value;
+            if (fr->name.len == name.len && eq_bytes(pool_at(c->pool, fr->name), nm, name.len)) return fr->value;
         }
     }
-    int rf = rootfield_id(nm, d->name.len);
+    int rf = rootfield_id(nm, name.len);
     if (rf >= 0) return root_val(scopes, (uint8_t)rf);
     return val_void();
 }
 
-static uint64_t val_hash(uint64_t h, Val v) {
-    h ^= v.kind; h *= 1099511628211ULL;
-    h ^= v.akind; h *= 1099511628211ULL;
-    h ^= v.idx; h *= 1099511628211ULL;
-    h ^= (uint64_t)v.s.off; h *= 1099511628211ULL;
-    h ^= (uint64_t)v.s.len; h *= 1099511628211ULL;
-    h ^= (uint64_t)v.n; h *= 1099511628211ULL;
-    h ^= (uint64_t)v.b; h *= 1099511628211ULL;
-    h ^= (uint64_t)v.lp.index; h *= 1099511628211ULL;
-    h ^= (uint64_t)v.lp.length; h *= 1099511628211ULL;
-    return h;
+static inline Val dep_value(Ctx *c, Scope *scopes, size_t nscopes, TplNeed *d) {
+    if (d->kind == 1) return root_val(scopes, d->root_field);
+    return dep_value_dyn(c, scopes, nscopes, d->name);
 }
 
-static bool val_equal(Val a, Val b) {
-    return a.kind == b.kind && a.akind == b.akind && a.idx == b.idx
-        && a.s.off == b.s.off && a.s.len == b.s.len && a.n == b.n && a.b == b.b
-        && a.lp.index == b.lp.index && a.lp.first == b.lp.first && a.lp.last == b.lp.last
-        && a.lp.length == b.lp.length;
+static inline uint64_t val_hash(uint64_t h, Val v) {
+    uint64_t w0, w1;
+    __builtin_memcpy(&w0, &v, 8);
+    __builtin_memcpy(&w1, (const uint8_t *)&v + 8, 8);
+    h = (h ^ w0) * 0x9e3779b97f4a7c15ULL;
+    h = (h ^ w1) * 0x9e3779b97f4a7c15ULL;
+    return h ^ (h >> 32);
 }
 
-void tpl_cache_open(Ctx *c, Pool *p) {
-    /* Index stays well above the stored-entry cap so probes stay short;
-     * entries are capped below the index size (a full index would loop). */
+static inline bool val_equal(Val a, Val b) {
+    uint64_t a0, a1, b0, b1;
+    __builtin_memcpy(&a0, &a, 8); __builtin_memcpy(&a1, (const uint8_t *)&a + 8, 8);
+    __builtin_memcpy(&b0, &b, 8); __builtin_memcpy(&b1, (const uint8_t *)&b + 8, 8);
+    return a0 == b0 && a1 == b1;
+}
+
+void tpl_cache_open(Ctx *c, Pool *p, Arr *templates, size_t npages) {
     size_t cap = 8192;
     c->tpl_index = pool_alloc(p, cap * sizeof(int32_t));
-    for (size_t i = 0; i < cap; i++) c->tpl_index[i] = -1;
+    fill_bytes(c->tpl_index, 0xff, cap * sizeof(int32_t));
     c->tpl_mask = cap - 1;
     arr_new(&c->tpl_entries, sizeof(TplHit));
+    size_t gsz = templates->len * INCLUDE_DEPTH;
+    if (gsz > 0) {
+        c->tpl_global = pool_alloc(p, gsz * sizeof(Sp));
+        fill_bytes(c->tpl_global, 0xff, gsz * sizeof(Sp));
+    } else {
+        c->tpl_global = 0;
+    }
+    size_t ncards = 0;
+    for (size_t k = 0; k < templates->len; k++) {
+        Tpl *t = arr_at(templates, k);
+        if (t->cache_mode == 2 && (size_t)t->card_slot + 1 > ncards) ncards = (size_t)t->card_slot + 1;
+    }
+    if (ncards > 0 && npages > 0) {
+        size_t csz = ncards * npages;
+        c->tpl_card_cache = pool_alloc(p, csz * sizeof(Sp));
+        fill_bytes(c->tpl_card_cache, 0xff, csz * sizeof(Sp));
+    } else {
+        c->tpl_card_cache = 0;
+    }
 }
 
-static Val root_val(Scope *scopes, uint8_t field) {
+static inline Val root_val(Scope *scopes, uint8_t field) {
     Scope *root = &scopes[0];
     if (!root->is_root) return val_void();
     switch (field) {
@@ -811,25 +847,31 @@ static Val root_val(Scope *scopes, uint8_t field) {
     }
 }
 
-static Val dyn_eval(Ctx *c, Scope *scopes, size_t nscopes, const uint8_t *name, size_t nlen, Arr *chain) {
+static inline Val walk_chain(Ctx *c, Val v, const uint8_t *chain, uint8_t clen) {
+    if (__builtin_expect(clen == 1, 1)) {
+        return val_field(c, v, chain[0]);
+    }
+    for (uint8_t k = 0; k < clen; k++) {
+        v = val_field(c, v, chain[k]);
+        if (v.kind == K_VOID) return val_void();
+    }
+    return v;
+}
+
+static Val dyn_eval(Ctx *c, Scope *scopes, size_t nscopes, const uint8_t *name, size_t nlen, const uint8_t *chain, uint8_t clen) {
     Val v = val_void();
     for (size_t fi = nscopes; fi-- > 0;) {
         Scope *fr = &scopes[fi];
         if (!fr->is_root) {
-            if (nlen == 4 && cmp_bytes(name, "loop", 4) == 0) { v = val_loop(fr->lp); break; }
-            const uint8_t *bn = pool_at(c->pool, fr->name);
-            if (fr->name.len == nlen && cmp_bytes(bn, name, nlen) == 0) { v = fr->value; break; }
+            if (nlen == 4 && eq_bytes(name, "loop", 4)) { v = val_loop(fr->lp); break; }
+            if (fr->name.len == nlen && eq_bytes(pool_at(c->pool, fr->name), name, nlen)) { v = fr->value; break; }
         } else {
             int rf = rootfield_id(name, nlen);
             if (rf >= 0) { v = root_val(scopes, (uint8_t)rf); break; }
         }
     }
-    for (size_t k = 0; k < chain->len; k++) {
-        uint8_t *f = arr_at(chain, k);
-        v = val_field(c, v, *f);
-        if (v.kind == K_VOID) return val_void();
-    }
-    return v;
+    if (clen == 0 || v.kind == K_VOID) return v;
+    return walk_chain(c, v, chain, clen);
 }
 
 Val tpl_eval(Ctx *c, Scope *scopes, size_t nscopes, Ref *ref) {
@@ -838,30 +880,22 @@ Val tpl_eval(Ctx *c, Scope *scopes, size_t nscopes, Ref *ref) {
             return val_void();
         case REF_ROOT: {
             Val v = root_val(scopes, ref->root_field);
-            for (size_t k = 0; k < ref->chain.len; k++) {
-                uint8_t *f = arr_at(&ref->chain, k);
-                v = val_field(c, v, *f);
-                if (v.kind == K_VOID) return val_void();
-            }
-            return v;
+            if (ref->chain_len == 0) return v;
+            return walk_chain(c, v, ref->chain, ref->chain_len);
         }
         case REF_SCOPE: {
             size_t idx = nscopes >= (size_t)1 + ref->offset ? nscopes - 1 - ref->offset : 0;
             Scope *fr = &scopes[idx];
-            const uint8_t *bn = pool_at(c->pool, fr->name);
-            if (!fr->is_root && fr->name.len == ref->name.len && cmp_bytes(bn, pool_at(c->pool, ref->name), ref->name.len) == 0) {
+            if (!fr->is_root && fr->name.len == ref->name.len
+                && eq_bytes(pool_at(c->pool, fr->name), pool_at(c->pool, ref->name), ref->name.len)) {
                 Val v = ref->is_loop ? val_loop(fr->lp) : fr->value;
-                for (size_t k = 0; k < ref->chain.len; k++) {
-                    uint8_t *f = arr_at(&ref->chain, k);
-                    v = val_field(c, v, *f);
-                    if (v.kind == K_VOID) return val_void();
-                }
-                return v;
+                if (ref->chain_len == 0) return v;
+                return walk_chain(c, v, ref->chain, ref->chain_len);
             }
-            return dyn_eval(c, scopes, nscopes, pool_at(c->pool, ref->name), ref->name.len, &ref->chain);
+            return dyn_eval(c, scopes, nscopes, pool_at(c->pool, ref->name), ref->name.len, ref->chain, ref->chain_len);
         }
         case REF_DYN:
-            return dyn_eval(c, scopes, nscopes, pool_at(c->pool, ref->name), ref->name.len, &ref->chain);
+            return dyn_eval(c, scopes, nscopes, pool_at(c->pool, ref->name), ref->name.len, ref->chain, ref->chain_len);
         default:
             return val_void();
     }
@@ -869,31 +903,34 @@ Val tpl_eval(Ctx *c, Scope *scopes, size_t nscopes, Ref *ref) {
 
 void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes,
               Pool *out, Str *scratch, uint32_t depth) {
-    for (size_t si = 0; si < nodes->len; si++) {
-        Node *seg = arr_at(nodes, si);
+    Node *arr = (Node *)nodes->items;
+    size_t nn = nodes->len;
+    for (size_t si = 0; si < nn; si++) {
+        Node *seg = &arr[si];
         switch (seg->kind) {
             case ND_TEXT:
-                /* Text lives in the working pool (c->pool); the output
-                 * goes to `out`. A same-pool copy would read `out`'s own
-                 * bytes at that offset. */
-                pool_put(out, pool_at(c->pool, seg->text), seg->text.len);
+                pool_put(out, c->pool->base + seg->u.text.off, seg->u.text.len);
                 break;
             case ND_VAR: {
-                Val v = tpl_eval(c, scopes, *nscopes, &seg->ref);
-                val_write(c, v, out, !seg->raw, scratch);
+                Val v = tpl_eval(c, scopes, *nscopes, &seg->u.var.ref);
+                if (__builtin_expect(v.kind == K_STR_JSON, 1)) {
+                    pool_put(out, c->pool->base + v.v.s.off, v.v.s.len);
+                } else {
+                    val_write(c, v, out, !seg->raw, scratch);
+                }
                 break;
             }
             case ND_IF: {
-                Val v = tpl_eval(c, scopes, *nscopes, &seg->ref);
+                Val v = tpl_eval(c, scopes, *nscopes, &seg->u.nif.ref);
                 bool t = val_true(c, v);
                 Arr *branch = 0;
-                if (t != seg->neg) branch = &seg->then_nodes;
-                else if (seg->has_else) branch = &seg->else_nodes;
+                if (t != (bool)seg->neg) branch = &seg->u.nif.then_nodes;
+                else if (seg->has_else) branch = &seg->u.nif.else_nodes;
                 if (branch) tpl_emit(c, templates, branch, scopes, nscopes, out, scratch, depth);
                 break;
             }
             case ND_FOR: {
-                Val v = tpl_eval(c, scopes, *nscopes, &seg->ref);
+                Val v = tpl_eval(c, scopes, *nscopes, &seg->u.nfor.ref);
                 if (v.kind == K_ARR) {
                     size_t len = ctx_arr_len(c, v.akind, v.idx);
                     for (size_t i = 0; i < len; i++) {
@@ -901,21 +938,46 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                         LoopInfo lp = {(int64_t)i + 1, i == 0, i + 1 == len, (int64_t)len};
                         Scope *fr = &scopes[(*nscopes)++];
                         fr->is_root = false;
-                        fr->name = seg->binder;
+                        fr->name = seg->u.nfor.binder;
                         fr->value = elem;
                         fr->lp = lp;
                         fr->page = -1; fr->posts = -1; fr->pager = -1; fr->tag = -1;
-                        tpl_emit(c, templates, &seg->body, scopes, nscopes, out, scratch, depth);
+                        tpl_emit(c, templates, &seg->u.nfor.body, scopes, nscopes, out, scratch, depth);
                         (*nscopes)--;
                     }
                 }
                 break;
             }
             case ND_INCLUDE: {
-                if (depth < INCLUDE_DEPTH && seg->tpl_idx >= 0) {
-                    size_t k = (size_t)seg->tpl_idx;
+                if (depth < INCLUDE_DEPTH && seg->u.ninc.tpl_idx >= 0) {
+                    size_t k = (size_t)seg->u.ninc.tpl_idx;
                     Tpl *t = arr_at(templates, k);
-                    if (t->cacheable && c->tpl_index) {
+                    if (t->cache_mode == 1) {
+                        Sp *slot = &c->tpl_global[k * INCLUDE_DEPTH + depth];
+                        if (__builtin_expect(slot->off != 0xffffffffu, 1)) {
+                            pool_copy(out, *slot);
+                        } else {
+                            uint32_t start = pool_mark(out);
+                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, depth + 1);
+                            *slot = pool_span(out, start);
+                        }
+                        break;
+                    }
+                    if (t->cache_mode == 2 && depth == 0 && c->tpl_card_cache) {
+                        Val dv = dep_value_dyn(c, scopes, *nscopes, t->dyn_name);
+                        if (__builtin_expect(dv.kind == K_OBJ && dv.akind == O_CARD && dv.idx < c->pages.len, 1)) {
+                            Sp *slot = &c->tpl_card_cache[(size_t)t->card_slot * c->pages.len + dv.idx];
+                            if (__builtin_expect(slot->off != 0xffffffffu, 1)) {
+                                pool_copy(out, *slot);
+                            } else {
+                                uint32_t start = pool_mark(out);
+                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, depth + 1);
+                                *slot = pool_span(out, start);
+                            }
+                            break;
+                        }
+                    }
+                    if (t->cache_mode != 0 && c->tpl_index) {
                         uint64_t h = 1469598103934665603ULL;
                         h ^= (uint64_t)k; h *= 1099511628211ULL;
                         h ^= (uint64_t)(depth + 1); h *= 1099511628211ULL;
@@ -944,7 +1006,7 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                             uint32_t start = pool_mark(out);
                             tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, depth + 1);
                             Sp span = pool_span(out, start);
-                            if (t->storable && c->tpl_entries.len < 4096) {
+                            if (c->tpl_entries.len < 4096) {
                                 TplHit *e = arr_slot(&c->tpl_entries, c->pool);
                                 e->hash = h; e->tpl_idx = (uint32_t)k; e->depth = (uint8_t)(depth + 1);
                                 e->nkeys = nk; e->bytes = span;

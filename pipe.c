@@ -32,9 +32,8 @@ static bool path_is_md(Pool *p, Sp path) {
 static Sp crlf_norm(Pool *p, Sp content) {
     const uint8_t *b = pool_at(p, content);
     size_t off = content.off, len = content.len, end = off + len;
-    /* Fast SSE scan for any '\r'; the common case has none (zero-copy). */
-    static const uint8_t cr[1] = {'\r'};
-    bool has_cr = scan_any(p->base, end, off, cr, 1) >= 0;
+    /* Fast SIMD scan for any '\r'; the common case has none (zero-copy). */
+    bool has_cr = scan_byte(p->base, end, off, '\r') >= 0;
     if (!has_cr) return content;
     (void)b;
     uint32_t start = pool_mark(p);
@@ -83,20 +82,17 @@ static int cmp_tags(void *ctx, const void *x, const void *y) {
     return u16_cmp(pool_at(p, a->slug), a->slug.len, pool_at(p, b->slug), b->slug.len);
 }
 
-static bool tpl_has(Arr *templates, Pool *p, const uint8_t *name, size_t n) {
+static int32_t tpl_find_idx(Arr *templates, Pool *p, const uint8_t *name, size_t n) {
     for (size_t k = 0; k < templates->len; k++) {
         Tpl *t = arr_at(templates, k);
-        if (t->name.len == n && cmp_bytes(pool_at(p, t->name), name, n) == 0) return true;
+        if (t->name.len == n && eq_bytes(pool_at(p, t->name), name, n)) return (int32_t)k;
     }
-    return false;
+    return -1;
 }
 
 static Tpl *tpl_find(Arr *templates, Pool *p, const uint8_t *name, size_t n) {
-    for (size_t k = 0; k < templates->len; k++) {
-        Tpl *t = arr_at(templates, k);
-        if (t->name.len == n && cmp_bytes(pool_at(p, t->name), name, n) == 0) return t;
-    }
-    return 0;
+    int32_t idx = tpl_find_idx(templates, p, name, n);
+    return idx >= 0 ? (Tpl *)arr_at(templates, (size_t)idx) : 0;
 }
 
 static Sp idx_url(Pool *p, Sp base, int64_t k) {
@@ -134,11 +130,17 @@ static size_t page_tags(Pool *p, Arr *names, Dict *cache, NameSlug *out, size_t 
 
 typedef struct { Sp dir; Set set; } DirTaken;
 
+static inline bool span_is_clean(Pool *p, Sp s) {
+    return s.len == 0 || scan_html_json_esc(pool_at(p, s), s.len, 0) < 0;
+}
+
 bool case_build(Pool *p, CaseInput *c, Pool *out) {
     /* readSources: sort files by path (code-unit order). */
     arr_sort(&c->files, p, p, cmp_pair);
     arr_sort(&c->templates, p, p, cmp_pair);
     Sp base = base_strip(p, c->site.base_url);
+    bool site_title_clean = span_is_clean(p, c->site.title);
+    bool site_base_clean = span_is_clean(p, base);
 
     /* templates: parse in name order; failures go to the report. */
     Arr templates; arr_new(&templates, sizeof(Tpl));
@@ -159,6 +161,7 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
         }
     }
     tpl_analyze(p, &templates);
+    bool md_pre_json = tpl_can_pre_json_md(&templates);
 
     /* frontMatter + permalinks (per source, in sorted path order). */
     Arr pages; arr_new(&pages, sizeof(Page));
@@ -180,7 +183,7 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
             st->a = path; st->b = content;
             continue;
         }
-        Sp text = crlf_norm(p, content);
+        Sp text = fp->has_cr ? crlf_norm(p, content) : content;
         Meta fm;
         Sp fm_err;
         if (!meta_parse(p, text, &fm, &fm_err)) {
@@ -226,7 +229,8 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
         }
         Sp layout = fm.has_layout ? fm.layout
             : pool_store(p, (const uint8_t *)(is_post ? "post" : "page"), 4);
-        if (!tpl_has(&templates, p, pool_at(p, layout), layout.len)) {
+        int32_t layout_idx = tpl_find_idx(&templates, p, pool_at(p, layout), layout.len);
+        if (layout_idx < 0) {
             uint32_t st = pool_mark(p);
             pool_put(p, (const uint8_t *)"refused ", 8);
             pool_copy(p, path);
@@ -296,7 +300,12 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
         pd->slug = slug; pd->out_dir = out_dir; pd->url = url;
         pd->html = SP_NONE; pd->excerpt = SP_NONE; pd->reading_minutes = 0;
         pd->toc = 0; pd->tags = 0; pd->newer = -1; pd->older = -1;
-        pd->is_post = is_post; pd->layout = layout; pd->body = fm.body;
+        pd->is_post = is_post;
+        pd->clean_mask = (uint8_t)((span_is_clean(p, pd->title) ? 1 : 0)
+            | (span_is_clean(p, pd->url) ? 2 : 0)
+            | (span_is_clean(p, pd->summary) ? 4 : 0));
+        pd->layout_tpl = layout_idx;
+        pd->layout = layout; pd->body = fm.body;
         Arr *ft = arr_slot(&fm_tags, p);
         *ft = fm.tags;
     }
@@ -307,12 +316,19 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
     Arr toc_store; arr_new(&toc_store, sizeof(Toc));
     Arr toc_arrays; arr_new(&toc_arrays, sizeof(Range));
     Dict md_slug_cache; dict_new(&md_slug_cache);
-    Str scratch; str_new(&scratch);
-    Str tmp; str_new(&tmp);
-    Str text_tmp; str_new(&text_tmp);
-    Str path_buf; str_new(&path_buf);
-    Str item_buf; str_new(&item_buf);
-    Str item_scratch; str_new(&item_scratch);
+    Dict page_map; dict_new(&page_map);
+    for (size_t pi = 0; pi < pages.len; pi++) {
+        Page *pd = arr_at(&pages, pi);
+        dict_put(&page_map, p, pd->path, (Sp){(uint32_t)pi, 0});
+    }
+    Set static_set; set_new(&static_set);
+    for (size_t si = 0; si < statics.len; si++) {
+        SpPair *st = arr_at(&statics, si);
+        set_add(&static_set, p, st->a);
+    }
+    static Str scratch, tmp, text_tmp, path_buf, item_buf, item_scratch;
+    str_clear(&scratch); str_clear(&tmp); str_clear(&text_tmp);
+    str_clear(&path_buf); str_clear(&item_buf); str_clear(&item_scratch);
     for (size_t pi = 0; pi < pages.len; pi++) {
         Page *pd = arr_at(&pages, pi);
         LinkCtx env;
@@ -320,23 +336,31 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
         env.npages = pages.len;
         env.statics = statics.len ? arr_at(&statics, 0) : 0;
         env.nstatics = statics.len;
+        env.page_map = &page_map;
+        env.static_set = &static_set;
         env.base = base;
         env.dir = path_dir(p, pd->path);
+        env.dir_np = 0;
+        if (env.dir.len > 0) {
+            const uint8_t *db = pool_at(p, env.dir);
+            size_t ds = 0;
+            for (size_t di = 0; di <= env.dir.len; di++) {
+                if (di == env.dir.len || db[di] == '/') {
+                    if (env.dir_np < 64) { env.dir_parts[env.dir_np] = db + ds; env.dir_plens[env.dir_np] = di - ds; env.dir_np++; }
+                    ds = di + 1;
+                }
+            }
+        }
         env.src_path = pd->path;
         env.broken = &broken;
         env.path_buf = &path_buf;
         env.item_buf = &item_buf;
         env.item_scratch = &item_scratch;
         Sp html, excerpt;
-        Arr toc; arr_new(&toc, sizeof(Toc));
-        md_build(p, pd->body, &env, &md_slug_cache, &scratch, &tmp, &text_tmp, &html, &toc, &excerpt);
-        uint32_t start = (uint32_t)toc_store.len;
-        for (size_t k = 0; k < toc.len; k++) {
-            Toc *t = arr_slot(&toc_store, p);
-            *t = *(Toc *)arr_at(&toc, k);
-        }
+        uint32_t toc_start = (uint32_t)toc_store.len;
+        md_build(p, pd->body, &env, &md_slug_cache, &scratch, &tmp, &text_tmp, &html, &toc_store, &excerpt, md_pre_json);
         Range *ra = arr_slot(&toc_arrays, p);
-        ra->start = start; ra->len = (uint32_t)toc.len;
+        ra->start = toc_start; ra->len = (uint32_t)toc_store.len - toc_start;
         pd->html = html;
         pd->excerpt = excerpt;
         pd->toc = (uint32_t)pi;
@@ -400,6 +424,7 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
                 ti = (uint32_t)tags.len;
                 Tag *t = arr_slot(&tags, p);
                 t->name = own[j].name; t->slug = own[j].slug; t->url = url;
+                t->clean_mask = (uint8_t)((span_is_clean(p, t->name) ? 1 : 0) | (site_base_clean ? 2 : 0));
                 arr_new(&t->posts, sizeof(uint32_t));
                 TagBySlug *e = arr_slot(&tag_by_slug, p);
                 e->slug = own[j].slug; e->idx = ti;
@@ -408,7 +433,7 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
             uint32_t *slot = arr_slot(&t->posts, p);
             *slot = pi;
             TagRef *r = arr_slot(&tagref_store, p);
-            r->name = t->name; r->slug = t->slug; r->url = t->url;
+            r->name = t->name; r->slug = t->slug; r->url = t->url; r->clean_mask = t->clean_mask;
         }
         Range *ra = arr_at(&tagref_arrays, pi);
         ra->start = start; ra->len = (uint32_t)tagref_store.len - start;
@@ -432,8 +457,8 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
                 }
             }
             TagRef *r = arr_slot(&tagref_store, p);
-            if (t) { r->name = t->name; r->slug = t->slug; r->url = t->url; }
-            else { r->name = own[j].name; r->slug = own[j].slug; r->url = SP_NONE; }
+            if (t) { r->name = t->name; r->slug = t->slug; r->url = t->url; r->clean_mask = t->clean_mask; }
+            else { r->name = own[j].name; r->slug = own[j].slug; r->url = SP_NONE; r->clean_mask = (uint8_t)((span_is_clean(p, r->name) ? 1 : 0) | 2); }
         }
         Range *ra = arr_at(&tagref_arrays, pi);
         ra->start = start; ra->len = (uint32_t)tagref_store.len - start;
@@ -488,7 +513,10 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
 
     Ctx st;
     st.pool = p;
-    tpl_cache_open(&st, p);
+    st.md_pre_json = md_pre_json;
+    st.site_title_clean = site_title_clean;
+    st.site_base_clean = site_base_clean;
+    tpl_cache_open(&st, p, &templates, pages.len);
     st.site_title = c->site.title;
     st.site_base = base;
     st.pages = pages;
@@ -512,7 +540,7 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
 
     /* layouts: render into the answers object. */
     Arr written_keys; arr_new(&written_keys, sizeof(Sp));
-    Str tscratch; str_new(&tscratch);
+    static Str tscratch; str_clear(&tscratch);
     Scope frames[128];
     size_t nframes;
     pool_u8(out, '{');
@@ -520,8 +548,8 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
     /* Pages, in source order. */
     for (size_t pi = 0; pi < st.pages.len; pi++) {
         Page *pd = arr_at(&st.pages, pi);
-        Tpl *tpl = tpl_find(&templates, p, pool_at(p, pd->layout), pd->layout.len);
-        if (!tpl) continue;
+        if (pd->layout_tpl < 0) continue;
+        Tpl *tpl = arr_at(&templates, (size_t)pd->layout_tpl);
         uint32_t kst = pool_mark(p);
         pool_copy(p, pd->out_dir);
         pool_put(p, (const uint8_t *)"/index.html", 11);
@@ -529,9 +557,9 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
         if (!first) pool_u8(out, ',');
         first = false;
         pool_u8(out, '"');
-        json_escape_into(out, pool_at(p, key), key.len);
-        pool_put(out, (const uint8_t *)"\":", 2);
-        pool_u8(out, '"');
+        if (pd->clean_mask & 2) pool_put(out, pool_at(p, key), key.len);
+        else json_escape_into(out, pool_at(p, key), key.len);
+        pool_put(out, (const uint8_t *)"\":\"", 3);
         Sp *wk = arr_slot(&written_keys, p);
         *wk = key;
         nframes = 1;
@@ -542,62 +570,62 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
         pool_u8(out, '"');
     }
     /* Index pages. */
-    for (int64_t k = 1; k <= npages; k++) {
-        Tpl *tpl = tpl_find(&templates, p, (const uint8_t *)"index", 5);
-        if (!tpl) break;
-        Sp key;
-        if (k == 1) {
-            key = pool_store(p, (const uint8_t *)"index.html", 10);
-        } else {
-            uint32_t kst = pool_mark(p);
-            pool_put(p, (const uint8_t *)"page/", 5);
-            pool_i64(p, k);
-            pool_put(p, (const uint8_t *)"/index.html", 11);
-            key = pool_span(p, kst);
+    {
+        Tpl *tpl_idx = tpl_find(&templates, p, (const uint8_t *)"index", 5);
+        for (int64_t k = 1; tpl_idx && k <= npages; k++) {
+            Sp key;
+            if (k == 1) {
+                key = pool_store(p, (const uint8_t *)"index.html", 10);
+            } else {
+                uint32_t kst = pool_mark(p);
+                pool_put(p, (const uint8_t *)"page/", 5);
+                pool_i64(p, k);
+                pool_put(p, (const uint8_t *)"/index.html", 11);
+                key = pool_span(p, kst);
+            }
+            if (!first) pool_u8(out, ',');
+            first = false;
+            pool_u8(out, '"');
+            pool_put(out, pool_at(p, key), key.len);
+            pool_put(out, (const uint8_t *)"\":\"", 3);
+            Sp *wk = arr_slot(&written_keys, p);
+            *wk = key;
+            nframes = 1;
+            frames[0].is_root = true;
+            frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
+            frames[0].page = -1;
+            frames[0].posts = (int32_t)(1 + st.tags.len + (size_t)(k - 1));
+            frames[0].pager = (int32_t)(k - 1);
+            frames[0].tag = -1;
+            tpl_emit(&st, &templates, &tpl_idx->nodes, frames, &nframes, out, &tscratch, 0);
+            pool_u8(out, '"');
         }
-        if (!first) pool_u8(out, ',');
-        first = false;
-        pool_u8(out, '"');
-        json_escape_into(out, pool_at(p, key), key.len);
-        pool_put(out, (const uint8_t *)"\":", 2);
-        pool_u8(out, '"');
-        Sp *wk = arr_slot(&written_keys, p);
-        *wk = key;
-        nframes = 1;
-        frames[0].is_root = true;
-        frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
-        frames[0].page = -1;
-        frames[0].posts = (int32_t)(1 + st.tags.len + (size_t)(k - 1));
-        frames[0].pager = (int32_t)(k - 1);
-        frames[0].tag = -1;
-        tpl_emit(&st, &templates, &tpl->nodes, frames, &nframes, out, &tscratch, 0);
-        pool_u8(out, '"');
     }
     /* Tag pages, in tag order. */
-    for (size_t ti = 0; ti < st.tags.len; ti++) {
-        Tpl *tpl = tpl_find(&templates, p, (const uint8_t *)"tag", 3);
-        if (!tpl) break;
-        Tag *t = arr_at(&st.tags, ti);
-        uint32_t kst = pool_mark(p);
-        pool_put(p, (const uint8_t *)"tags/", 5);
-        pool_copy(p, t->slug);
-        pool_put(p, (const uint8_t *)"/index.html", 11);
-        Sp key = pool_span(p, kst);
-        if (!first) pool_u8(out, ',');
-        first = false;
-        pool_u8(out, '"');
-        json_escape_into(out, pool_at(p, key), key.len);
-        pool_put(out, (const uint8_t *)"\":", 2);
-        pool_u8(out, '"');
-        Sp *wk = arr_slot(&written_keys, p);
-        *wk = key;
-        nframes = 1;
-        frames[0].is_root = true;
-        frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
-        frames[0].page = -1; frames[0].posts = -1; frames[0].pager = -1;
-        frames[0].tag = (int32_t)ti;
-        tpl_emit(&st, &templates, &tpl->nodes, frames, &nframes, out, &tscratch, 0);
-        pool_u8(out, '"');
+    {
+        Tpl *tpl_tag = tpl_find(&templates, p, (const uint8_t *)"tag", 3);
+        for (size_t ti = 0; tpl_tag && ti < st.tags.len; ti++) {
+            Tag *t = arr_at(&st.tags, ti);
+            uint32_t kst = pool_mark(p);
+            pool_put(p, (const uint8_t *)"tags/", 5);
+            pool_copy(p, t->slug);
+            pool_put(p, (const uint8_t *)"/index.html", 11);
+            Sp key = pool_span(p, kst);
+            if (!first) pool_u8(out, ',');
+            first = false;
+            pool_u8(out, '"');
+            pool_put(out, pool_at(p, key), key.len);
+            pool_put(out, (const uint8_t *)"\":\"", 3);
+            Sp *wk = arr_slot(&written_keys, p);
+            *wk = key;
+            nframes = 1;
+            frames[0].is_root = true;
+            frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
+            frames[0].page = -1; frames[0].posts = -1; frames[0].pager = -1;
+            frames[0].tag = (int32_t)ti;
+            tpl_emit(&st, &templates, &tpl_tag->nodes, frames, &nframes, out, &tscratch, 0);
+            pool_u8(out, '"');
+        }
     }
     /* Tags index. */
     {
@@ -606,10 +634,7 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
             Sp key = pool_store(p, (const uint8_t *)"tags/index.html", 15);
             if (!first) pool_u8(out, ',');
             first = false;
-            pool_u8(out, '"');
-            json_escape_into(out, pool_at(p, key), key.len);
-            pool_put(out, (const uint8_t *)"\":", 2);
-            pool_u8(out, '"');
+            pool_put(out, (const uint8_t *)"\"tags/index.html\":\"", 19);
             Sp *wk = arr_slot(&written_keys, p);
             *wk = key;
             nframes = 1;
@@ -621,37 +646,32 @@ bool case_build(Pool *p, CaseInput *c, Pool *out) {
         }
     }
     /* Statics, in path order; shadowed ones are reported, not written. */
-    for (size_t i = 0; i < statics.len; i++) {
-        SpPair *sp = arr_at(&statics, i);
-        bool shadowed = false;
+    if (statics.len > 0) {
+        Set written_set; set_new(&written_set);
         for (size_t k = 0; k < written_keys.len; k++) {
-            Sp *wk = arr_at(&written_keys, k);
-            if (wk->len == sp->a.len && cmp_bytes(pool_at(p, *wk), pool_at(p, sp->a), sp->a.len) == 0) { shadowed = true; break; }
+            set_add(&written_set, p, *(Sp *)arr_at(&written_keys, k));
         }
-        if (shadowed) {
-            uint32_t st2 = pool_mark(p);
-            pool_put(p, (const uint8_t *)"shadowed ", 9);
-            pool_copy(p, sp->a);
-            pool_put(p, (const uint8_t *)": a built page has its path", 27);
-            Sp span_st2 = pool_span(p, st2);
-            Sp *line = arr_slot(&report, p);
-            *line = span_st2;
-            continue;
+        for (size_t i = 0; i < statics.len; i++) {
+            SpPair *sp = arr_at(&statics, i);
+            if (!set_add(&written_set, p, sp->a)) {
+                uint32_t st2 = pool_mark(p);
+                pool_put(p, (const uint8_t *)"shadowed ", 9);
+                pool_copy(p, sp->a);
+                pool_put(p, (const uint8_t *)": a built page has its path", 27);
+                Sp span_st2 = pool_span(p, st2);
+                Sp *line = arr_slot(&report, p);
+                *line = span_st2;
+                continue;
+            }
+            if (!first) pool_u8(out, ',');
+            first = false;
+            pool_u8(out, '"');
+            json_escape_into(out, pool_at(p, sp->a), sp->a.len);
+            pool_put(out, (const uint8_t *)"\":", 2);
+            pool_u8(out, '"');
+            json_escape_into(out, pool_at(p, sp->b), sp->b.len);
+            pool_u8(out, '"');
         }
-        if (!first) pool_u8(out, ',');
-        first = false;
-        pool_u8(out, '"');
-        json_escape_into(out, pool_at(p, sp->a), sp->a.len);
-        pool_put(out, (const uint8_t *)"\":", 2);
-        pool_u8(out, '"');
-        json_escape_into(out, pool_at(p, sp->b), sp->b.len);
-        pool_u8(out, '"');
-        /* Vendor checks Object.hasOwn(output) for statics, so a written
-           static's key must join written_keys (the reference C omits this
-           and lets a duplicate static overwrite; the vendor keeps the first
-           and reports "shadowed"). */
-        Sp *wk2 = arr_slot(&written_keys, p);
-        *wk2 = sp->a;
     }
     /* report: sorted lines (broken links deduped) + the counts line. */
     if (broken.len > 1) arr_sort(&broken, p, p, cmp_sp);
@@ -726,10 +746,12 @@ bool cases_build(Pool *p, const uint8_t *input, size_t n, Pool *out) {
     Cur cur = {p, input_s.off, input_s.off + input_s.len};
     Arr cases; arr_new(&cases, sizeof(CaseInput));
     if (!json_read_all(&cur, &cases)) return false;
+    size_t reset_len = p->len;
     pool_u8(out, '[');
     for (size_t i = 0; i < cases.len; i++) {
         if (i > 0) pool_u8(out, ',');
         CaseInput *c = arr_at(&cases, i);
+        p->len = reset_len;
         if (!case_build(p, c, out)) return false;
     }
     pool_u8(out, ']');

@@ -190,22 +190,22 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
     if (v.kind == K_OBJ) {
         switch (v.akind) {
             case O_SITE:
-                if (f == F_TITLE) return val_str(c->site_title);
-                if (f == F_BASE_URL) return val_str(c->site_base);
+                if (f == F_TITLE) return c->site_title_clean ? val_str_json(c->site_title) : val_str(c->site_title);
+                if (f == F_BASE_URL) return c->site_base_clean ? val_str_json(c->site_base) : val_str(c->site_base);
                 return val_void();
             case O_PAGE: {
                 Page *p = arr_at(&c->pages, v.idx);
                 switch (f) {
-                    case F_TITLE: return val_str(p->title);
-                    case F_URL: return val_str(p->url);
-                    case F_DATE: return val_str(p->date);
-                    case F_DATE_LONG: return val_str(p->date_long);
-                    case F_SUMMARY: return val_str(p->summary);
-                    case F_EXCERPT: return val_str(p->excerpt);
+                    case F_TITLE: return (p->clean_mask & 1) ? val_str_json(p->title) : val_str(p->title);
+                    case F_URL: return (p->clean_mask & 2) ? val_str_json(p->url) : val_str(p->url);
+                    case F_DATE: return val_str_json(p->date);
+                    case F_DATE_LONG: return val_str_json(p->date_long);
+                    case F_SUMMARY: return (p->clean_mask & 4) ? val_str_json(p->summary) : val_str(p->summary);
+                    case F_EXCERPT: return c->md_pre_json ? val_str_json(p->excerpt) : val_str(p->excerpt);
                     case F_READING_MINUTES: return val_int(p->reading_minutes);
                     case F_TAGS: return val_arr(A_TAGREFS, p->tags);
-                    case F_SLUG: return val_str(p->slug);
-                    case F_CONTENT: return val_str(p->html);
+                    case F_SLUG: return val_str_json(p->slug);
+                    case F_CONTENT: return c->md_pre_json ? val_str_json(p->html) : val_str(p->html);
                     case F_TOC: return val_arr(A_TOC, p->toc);
                     case F_NEWER: return p->newer >= 0 ? val_obj(O_LINK, (uint32_t)p->newer) : val_null();
                     case F_OLDER: return p->older >= 0 ? val_obj(O_LINK, (uint32_t)p->older) : val_null();
@@ -216,12 +216,12 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
             case O_CARD: {
                 Page *p = arr_at(&c->pages, v.idx);
                 switch (f) {
-                    case F_TITLE: return val_str(p->title);
-                    case F_URL: return val_str(p->url);
-                    case F_DATE: return val_str(p->date);
-                    case F_DATE_LONG: return val_str(p->date_long);
-                    case F_SUMMARY: return val_str(p->summary);
-                    case F_EXCERPT: return val_str(p->excerpt);
+                    case F_TITLE: return (p->clean_mask & 1) ? val_str_json(p->title) : val_str(p->title);
+                    case F_URL: return (p->clean_mask & 2) ? val_str_json(p->url) : val_str(p->url);
+                    case F_DATE: return val_str_json(p->date);
+                    case F_DATE_LONG: return val_str_json(p->date_long);
+                    case F_SUMMARY: return (p->clean_mask & 4) ? val_str_json(p->summary) : val_str(p->summary);
+                    case F_EXCERPT: return c->md_pre_json ? val_str_json(p->excerpt) : val_str(p->excerpt);
                     case F_READING_MINUTES: return val_int(p->reading_minutes);
                     case F_TAGS: return val_arr(A_TAGREFS, p->tags);
                     default: return val_void();
@@ -230,9 +230,9 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
             case O_TAGSUM: {
                 Tag *t = arr_at(&c->tags, v.idx);
                 switch (f) {
-                    case F_NAME: return val_str(t->name);
-                    case F_SLUG: return val_str(t->slug);
-                    case F_URL: return val_str(t->url);
+                    case F_NAME: return (t->clean_mask & 1) ? val_str_json(t->name) : val_str(t->name);
+                    case F_SLUG: return val_str_json(t->slug);
+                    case F_URL: return (t->clean_mask & 2) ? val_str_json(t->url) : val_str(t->url);
                     case F_COUNT: return val_int((int64_t)t->posts.len);
                     default: return val_void();
                 }
@@ -240,9 +240,9 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
             case O_TAG: {
                 Tag *t = arr_at(&c->tags, v.idx);
                 switch (f) {
-                    case F_NAME: return val_str(t->name);
-                    case F_SLUG: return val_str(t->slug);
-                    case F_URL: return val_str(t->url);
+                    case F_NAME: return (t->clean_mask & 1) ? val_str_json(t->name) : val_str(t->name);
+                    case F_SLUG: return val_str_json(t->slug);
+                    case F_URL: return (t->clean_mask & 2) ? val_str_json(t->url) : val_str(t->url);
                     case F_COUNT: return val_int((int64_t)t->posts.len);
                     case F_POSTS: return val_arr(A_CARDS, 1 + v.idx);
                     default: return val_void();
@@ -251,9 +251,9 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
             case O_TAGREF: {
                 TagRef *r = arr_at(&c->tagref_store, v.idx);
                 switch (f) {
-                    case F_NAME: return val_str(r->name);
-                    case F_SLUG: return val_str(r->slug);
-                    case F_URL: return val_str(r->url);
+                    case F_NAME: return (r->clean_mask & 1) ? val_str_json(r->name) : val_str(r->name);
+                    case F_SLUG: return val_str_json(r->slug);
+                    case F_URL: return (r->clean_mask & 2) ? val_str_json(r->url) : val_str(r->url);
                     default: return val_void();
                 }
             }
@@ -261,18 +261,18 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
                 Toc *t = arr_at(&c->toc_store, v.idx);
                 switch (f) {
                     case F_LEVEL: return val_int(t->level);
-                    case F_ID: return val_str(t->id);
-                    case F_HTML: return val_str(t->html);
+                    case F_ID: return val_str_json(t->id);
+                    case F_HTML: return c->md_pre_json ? val_str_json(t->html) : val_str(t->html);
                     default: return val_void();
                 }
             }
             case O_LINK: {
                 Page *p = arr_at(&c->pages, v.idx);
                 switch (f) {
-                    case F_TITLE: return val_str(p->title);
-                    case F_URL: return val_str(p->url);
-                    case F_DATE: return val_str(p->date);
-                    case F_DATE_LONG: return val_str(p->date_long);
+                    case F_TITLE: return (p->clean_mask & 1) ? val_str_json(p->title) : val_str(p->title);
+                    case F_URL: return (p->clean_mask & 2) ? val_str_json(p->url) : val_str(p->url);
+                    case F_DATE: return val_str_json(p->date);
+                    case F_DATE_LONG: return val_str_json(p->date_long);
                     default: return val_void();
                 }
             }
@@ -281,9 +281,9 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
                 switch (f) {
                     case F_NUMBER: return val_int(p->number);
                     case F_TOTAL: return val_int(p->total);
-                    case F_URL: return val_str(p->url);
-                    case F_NEWER_URL: return val_str(p->newer_url);
-                    case F_OLDER_URL: return val_str(p->older_url);
+                    case F_URL: return c->site_base_clean ? val_str_json(p->url) : val_str(p->url);
+                    case F_NEWER_URL: return c->site_base_clean ? val_str_json(p->newer_url) : val_str(p->newer_url);
+                    case F_OLDER_URL: return c->site_base_clean ? val_str_json(p->older_url) : val_str(p->older_url);
                     default: return val_void();
                 }
             }
@@ -293,10 +293,10 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
     }
     if (v.kind == K_LOOP) {
         switch (f) {
-            case F_INDEX: return val_int(v.lp.index);
-            case F_FIRST: return val_bool(v.lp.first);
-            case F_LAST: return val_bool(v.lp.last);
-            case F_LENGTH: return val_int(v.lp.length);
+            case F_INDEX: return val_int((int64_t)v.idx);
+            case F_FIRST: return val_bool(v.idx == 1);
+            case F_LAST: return val_bool((uint64_t)v.idx == v.v.u);
+            case F_LENGTH: return val_int((int64_t)v.v.u);
             default: return val_void();
         }
     }
@@ -311,9 +311,9 @@ bool val_true(Ctx *c, Val v) {
     switch (v.kind) {
         case K_ARR: return ctx_arr_len(c, v.akind, v.idx) > 0;
         case K_VOID: case K_NULL: return false;
-        case K_BOOL: return v.b;
-        case K_INT: return v.n != 0;
-        case K_STR: return v.s.len > 0;
+        case K_BOOL: return v.v.n != 0;
+        case K_INT: return v.v.n != 0;
+        case K_STR: case K_STR_JSON: return v.v.s.len > 0;
         case K_OBJ: case K_LOOP: return true;
         default: return false;
     }
@@ -321,14 +321,14 @@ bool val_true(Ctx *c, Val v) {
 
 void val_text(Ctx *c, Val v, Str *scratch) {
     switch (v.kind) {
-        case K_STR:
-            str_add(scratch, pool_at(c->pool, v.s), v.s.len);
+        case K_STR: case K_STR_JSON:
+            str_add(scratch, pool_at(c->pool, v.v.s), v.v.s.len);
             return;
         case K_INT:
-            str_i64(scratch, v.n);
+            str_i64(scratch, v.v.n);
             return;
         case K_BOOL:
-            str_cstr(scratch, v.b ? "true" : "false");
+            str_cstr(scratch, v.v.n ? "true" : "false");
             return;
         case K_ARR: {
             size_t len = ctx_arr_len(c, v.akind, v.idx);
@@ -345,17 +345,20 @@ void val_text(Ctx *c, Val v, Str *scratch) {
 
 void val_write(Ctx *c, Val v, Pool *out, bool esc, Str *scratch) {
     switch (v.kind) {
+        case K_STR_JSON:
+            pool_put(out, pool_at(c->pool, v.v.s), v.v.s.len);
+            return;
         case K_STR: {
-            const uint8_t *b = pool_at(c->pool, v.s);
-            if (esc) html_json_escape_into(out, b, v.s.len);
-            else json_escape_into(out, b, v.s.len);
+            const uint8_t *b = pool_at(c->pool, v.v.s);
+            if (esc) html_json_escape_into(out, b, v.v.s.len);
+            else json_escape_into(out, b, v.v.s.len);
             return;
         }
         case K_INT:
-            pool_i64(out, v.n);
+            pool_i64(out, v.v.n);
             return;
         case K_BOOL:
-            pool_put(out, (const uint8_t *)(v.b ? "true" : "false"), v.b ? 4 : 5);
+            pool_put(out, (const uint8_t *)(v.v.n ? "true" : "false"), v.v.n ? 4 : 5);
             return;
         case K_ARR:
             str_clear(scratch);

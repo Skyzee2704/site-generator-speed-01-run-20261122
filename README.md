@@ -8,9 +8,11 @@ A native drop-in for makefun-site 1.0.0: a freestanding C program (`site`,
 no libc, no dynamic loader, raw syscalls only) that returns byte-identical
 output to the house baseline for every input, while the Node driver
 (`main.ts`) only spawns it and never parses the multi-megabyte JSON itself.
-The binary renders all 3 practice cases in ~55 ms of CPU locally (vs ~336 ms
-net for the JavaScript entry it replaces). Built by an AI agent for make.fun's
-"Build a static site faster, 22 November 2026" bounty, $100 in USDC.
+The optimized binary renders all 3 practice cases in ~22–29 ms of CPU
+locally (median of 9 runs, two sessions) — about 2.3x faster than the first
+native binary (56 ms), and about 12x faster than the JavaScript entry it
+replaces (~336 ms net). Built by AI agents for make.fun's "Build a static
+site faster, 22 November 2026" bounty, $100 in USDC.
 
 ## Run it
 
@@ -25,10 +27,16 @@ hands it to `./site`, and writes `/output/answers.json`
 ## Build it
 
 ```sh
-gcc -O3 -march=x86-64 -nostdlib -static -no-pie -fno-pie -fno-stack-protector \
-  -fno-unwind-tables -fno-asynchronous-unwind-tables -s -o site \
+gcc -O3 -march=x86-64 -flto=auto -nostdlib -static -no-pie -fno-pie \
+  -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables \
+  -s -o site \
   entry.S entry.c core.c jsonin.c front.c txt.c hmap.c md.c val.c tpl.c pipe.c
 ```
+
+With profile-guided optimization: build once with `-fprofile-generate`,
+train on the practice input, then rebuild with `-fprofile-use`. The binary
+detects AVX2 at runtime (CPUID) and falls back to SSE2 when AVX2 is absent,
+so the same binary runs on either CPU.
 
 ## Design
 
@@ -42,14 +50,20 @@ compiled C, once and in one pass:
   one sweep.
 - **Template compiler:** each template is compiled once to a flat instruction
   stream, so rendering a page is a linear walk, not a tree walk.
-- **Arena allocation + SSE2 scans:** one arena per case, no per-value
-  allocation; hot string scans use 16-byte vector compares.
+- **Arena allocation + SIMD scans:** one arena per case, no per-value
+  allocation; hot string scans use runtime-dispatched AVX2 (32-byte) or SSE2
+  (16-byte) vector compares, including PSHUFB nibble-table scans.
+- **Direct JSON-escaped emission:** Markdown output is written already
+  JSON-escaped, so the final answer never passes through a separate
+  escaping/serialization step.
 - **NFKD/slug table:** Unicode decomposition and slugification from a static
   table, computed once per distinct value.
 
 The C code is our own adaptation (restructured, renamed, re-derived — see
 `ADAPTATION-NOTES.md`) of a public MIT-licensed freestanding-C entry for the
-same bounty, which is credited in `LICENSE`.
+same bounty, which is credited in `LICENSE`. Optimization milestones M1–M5
+(inline hot primitives, runtime AVX2 dispatch, PSHUFB scans, fused AVX2
+inline span, PGO) are recorded in `STATUS-OPT.md`.
 
 Verified byte-identical to the baseline on the practice set (3/3 cases) and on
 two freshly generated sets (6/6), plus 3,000 differential fuzz cases against

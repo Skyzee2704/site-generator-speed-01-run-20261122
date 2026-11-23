@@ -4,24 +4,15 @@
  * so the hash function and growth policy do not affect output. */
 #include "zg.h"
 
-static uint64_t fnv1a(const uint8_t *b, size_t n) {
-    uint64_t h = 14695981039346656037ull;
-    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
-    return h;
-}
-
-static uint64_t fnv1a_span(Pool *p, Sp s) {
-    return fnv1a(p->base + s.off, s.len);
-}
-
 /* Find the slot for a key: the slot holding it, or the first empty slot
  * after its probe run. `found` reports whether the key is present. */
 static size_t dict_slot(Dict *d, Pool *p, const uint8_t *key, size_t klen, bool *found) {
     size_t mask = d->mask;
-    size_t i = (size_t)(fnv1a(key, klen) & mask);
-    while (d->used.items && ((uint8_t *)d->used.items)[i]) {
-        Sp *k = arr_at(&d->keys, i);
-        if (k->len == klen && cmp_bytes(p->base + k->off, key, klen) == 0) {
+    size_t i = (size_t)(hash_bytes(key, klen) & mask);
+    uint8_t *used = (uint8_t *)d->used.items;
+    Sp *keys = (Sp *)d->keys.items;
+    while (used && used[i]) {
+        if (keys[i].len == klen && eq_bytes(p->base + keys[i].off, key, klen)) {
             *found = true;
             return i;
         }
@@ -101,10 +92,11 @@ bool dict_has(Dict *d, Pool *p, const uint8_t *key, size_t klen) {
 
 static size_t set_slot(Set *s, Pool *p, const uint8_t *key, size_t klen, bool *found) {
     size_t mask = s->mask;
-    size_t i = (size_t)(fnv1a(key, klen) & mask);
-    while (s->used.items && ((uint8_t *)s->used.items)[i]) {
-        Sp *k = arr_at(&s->keys, i);
-        if (k->len == klen && cmp_bytes(p->base + k->off, key, klen) == 0) {
+    size_t i = (size_t)(hash_bytes(key, klen) & mask);
+    uint8_t *used = (uint8_t *)s->used.items;
+    Sp *keys = (Sp *)s->keys.items;
+    while (used && used[i]) {
+        if (keys[i].len == klen && eq_bytes(p->base + keys[i].off, key, klen)) {
             *found = true;
             return i;
         }

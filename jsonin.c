@@ -3,6 +3,7 @@
  * spans straight into the input. Only strings that contain a `\`
  * escape are decoded into fresh pool bytes. */
 #include "zg.h"
+#include <immintrin.h>
 
 static inline uint8_t cur_peek(Cur *c) {
     return c->pos < c->end ? c->pool->base[c->pos] : 0;
@@ -56,7 +57,7 @@ static void put_utf8(uint8_t *buf, size_t *w, uint32_t cp) {
 /* Handle one escape at buf[*r] == '\\': consume it, write the decoded
  * bytes to buf[*w], advance both cursors. Same semantics as the
  * reference unescaper (lone surrogates -> U+FFFD). */
-static bool unescape_one(uint8_t *buf, size_t end, size_t *rp, size_t *wp) {
+static bool unescape_one(uint8_t *buf, size_t end, size_t *rp, size_t *wp, uint8_t *has_cr) {
     size_t r = *rp, w = *wp;
     r++; /* skip '\\' */
     if (r >= end) return false;
@@ -68,16 +69,18 @@ static bool unescape_one(uint8_t *buf, size_t end, size_t *rp, size_t *wp) {
         case 'b': buf[w++] = 0x08; break;
         case 'f': buf[w++] = 0x0c; break;
         case 'n': buf[w++] = '\n'; break;
-        case 'r': buf[w++] = '\r'; break;
+        case 'r': buf[w++] = '\r'; if (has_cr) *has_cr = 1; break;
         case 't': buf[w++] = '\t'; break;
         case 'u': {
             uint32_t cp;
             if (!hex4_buf(buf, end, &r, &cp)) return false;
+            if (cp == 0x0d && has_cr) *has_cr = 1;
             if (cp >= 0xd800 && cp < 0xdc00) {
                 if (r + 1 < end && buf[r] == '\\' && buf[r + 1] == 'u') {
                     r += 2;
                     uint32_t lo;
                     if (!hex4_buf(buf, end, &r, &lo)) return false;
+                    if (lo == 0x0d && has_cr) *has_cr = 1;
                     if (lo >= 0xdc00 && lo < 0xe000) {
                         put_utf8(buf, &w, 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00));
                     } else {
@@ -101,26 +104,28 @@ static bool unescape_one(uint8_t *buf, size_t end, size_t *rp, size_t *wp) {
     return true;
 }
 
-static bool parse_string_escaped(Cur *c, size_t start, size_t first_esc, Sp *out);
-static bool parse_string(Cur *c, Sp *out) {
+static bool parse_string_escaped(Cur *c, size_t start, size_t first_esc, Sp *out, uint8_t *has_cr_out);
+static bool parse_string_ex(Cur *c, Sp *out, uint8_t *has_cr_out) {
     cur_ws(c);
     if (cur_peek(c) != '"') return false;
     c->pos++;
     size_t start = c->pos;
-    for (;;) {
-        const uint8_t *slice = c->pool->base + c->pos;
-        size_t n = c->end - c->pos;
-        static const uint8_t needles[2] = {'"', '\\'};
-        int j = scan_any(slice, n, 0, needles, 2);
-        if (j < 0) return false;
-        size_t abs = c->pos + (size_t)j;
-        if (c->pool->base[abs] == '"') {
-            *out = (Sp){(uint32_t)start, (uint32_t)(abs - start)};
-            c->pos = abs + 1;
-            return true;
-        }
-        return parse_string_escaped(c, start, abs, out);
+    const uint8_t *slice = c->pool->base + c->pos;
+    size_t n = c->end - c->pos;
+    int j = scan_two(slice, n, 0, '"', '\\');
+    if (j < 0) return false;
+    size_t abs = c->pos + (size_t)j;
+    if (c->pool->base[abs] == '"') {
+        *out = (Sp){(uint32_t)start, (uint32_t)(abs - start)};
+        if (has_cr_out) *has_cr_out = (scan_byte(c->pool->base, abs, start, '\r') >= 0) ? 1 : 0;
+        c->pos = abs + 1;
+        return true;
     }
+    return parse_string_escaped(c, start, abs, out, has_cr_out);
+}
+
+static inline bool parse_string(Cur *c, Sp *out) {
+    return parse_string_ex(c, out, 0);
 }
 
 /* In-place JSON string unescape. The decoded output is written into the
@@ -130,44 +135,157 @@ static bool parse_string(Cur *c, Sp *out) {
  * 16-byte chunks are copied with one SIMD load/store; chunks containing
  * '"' or '\\' (and the tail) go through the scalar loop. The returned
  * span points into the input region (same pool, before the tail). */
-static bool parse_string_escaped(Cur *c, size_t start, size_t first_esc, Sp *out) {
+/* Overlap-safe forward copy of k < 32 bytes where dst <= src. */
+static inline void copy_fwd_lt32(uint8_t *dst, const uint8_t *src, size_t k) {
+    if (k >= 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)src);
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(src + k - 16));
+        _mm_storeu_si128((__m128i *)dst, v0);
+        _mm_storeu_si128((__m128i *)(dst + k - 16), v1);
+        return;
+    }
+    if (k >= 8) {
+        uint64_t a, b;
+        __builtin_memcpy(&a, src, 8); __builtin_memcpy(&b, src + k - 8, 8);
+        __builtin_memcpy(dst, &a, 8); __builtin_memcpy(dst + k - 8, &b, 8);
+        return;
+    }
+    if (k >= 4) {
+        uint32_t a, b;
+        __builtin_memcpy(&a, src, 4); __builtin_memcpy(&b, src + k - 4, 4);
+        __builtin_memcpy(dst, &a, 4); __builtin_memcpy(dst + k - 4, &b, 4);
+        return;
+    }
+    if (k >= 2) {
+        uint16_t a, b;
+        __builtin_memcpy(&a, src, 2); __builtin_memcpy(&b, src + k - 2, 2);
+        __builtin_memcpy(dst, &a, 2); __builtin_memcpy(dst + k - 2, &b, 2);
+        return;
+    }
+    if (k == 1) *dst = *src;
+}
+
+__attribute__((target("avx2,bmi")))
+static bool parse_string_escaped_avx2(Cur *c, size_t start, size_t first_esc, Sp *out, uint8_t *has_cr_out) {
     uint8_t *buf = c->pool->base;
     size_t end = c->end;
     size_t w = first_esc, r = first_esc;
+    uint8_t has_cr = 0;
+    if (has_cr_out) {
+        for (size_t k = start; k < first_esc; k++) if (buf[k] == '\r') { has_cr = 1; break; }
+    }
+    __m256i vq = _mm256_set1_epi8('"');
+    __m256i vbs = _mm256_set1_epi8('\\');
+    __m256i vcr = _mm256_set1_epi8('\r');
+    __m256i any_cr = _mm256_setzero_si256();
     for (;;) {
-        size_t chunk_end;
-        if (r + 16 <= end) {
-            __m128i v = _mm_loadu_si128((const __m128i *)(buf + r));
-            __m128i q = _mm_cmpeq_epi8(v, _mm_set1_epi8('"'));
-            __m128i bs = _mm_cmpeq_epi8(v, _mm_set1_epi8('\\'));
-            if (_mm_movemask_epi8(_mm_or_si128(q, bs)) == 0) {
-                /* Forward-overlap copy: dst <= src and the next load is
-                 * past this store, so no byte is read after written. */
-                _mm_storeu_si128((__m128i *)(buf + w), v);
-                w += 16; r += 16;
+        while (r + 32 <= end) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(buf + r));
+            if (has_cr_out) any_cr = _mm256_or_si256(any_cr, _mm256_cmpeq_epi8(v, vcr));
+            uint32_t m = (uint32_t)_mm256_movemask_epi8(
+                _mm256_or_si256(_mm256_cmpeq_epi8(v, vq), _mm256_cmpeq_epi8(v, vbs)));
+            if (m == 0) {
+                _mm256_storeu_si256((__m256i *)(buf + w), v);
+                w += 32; r += 32;
                 continue;
             }
-            chunk_end = r + 16;
-        } else {
-            chunk_end = end;
+            size_t k = (size_t)__builtin_ctz(m);
+            if (k > 0) {
+                if (r - w >= 32) {
+                    _mm256_storeu_si256((__m256i *)(buf + w), v);
+                } else {
+                    copy_fwd_lt32(buf + w, buf + r, k);
+                }
+                w += k; r += k;
+            }
+            if (buf[r] == '"') {
+                c->pos = r + 1;
+                *out = (Sp){(uint32_t)start, (uint32_t)(w - start)};
+                if (has_cr_out) *has_cr_out = (uint8_t)(has_cr | (_mm256_movemask_epi8(any_cr) != 0));
+                return true;
+            }
+            /* Fast inline loop for consecutive escapes (e.g. \n\n, \") */
+            do {
+                if (__builtin_expect(r + 1 < end, 1)) {
+                    uint8_t e = buf[r + 1];
+                    if (e == 'n') { buf[w++] = '\n'; r += 2; continue; }
+                    if (e == '"') { buf[w++] = '"'; r += 2; continue; }
+                    if (e == '\\') { buf[w++] = '\\'; r += 2; continue; }
+                    if (e == 't') { buf[w++] = '\t'; r += 2; continue; }
+                    if (e == 'r') { buf[w++] = '\r'; has_cr = 1; r += 2; continue; }
+                }
+                if (!unescape_one(buf, end, &r, &w, &has_cr)) return false;
+            } while (r < end && buf[r] == '\\');
         }
-        /* Scalar: plain bytes, the closing quote, or one escape at a time.
-         * An escape may consume bytes past chunk_end; the outer loop then
-         * resumes from the new r. */
-        while (r < chunk_end) {
+        while (r < end) {
             uint8_t ch = buf[r];
             if (ch == '"') {
                 c->pos = r + 1;
                 *out = (Sp){(uint32_t)start, (uint32_t)(w - start)};
+                if (has_cr_out) *has_cr_out = (uint8_t)(has_cr | (_mm256_movemask_epi8(any_cr) != 0));
                 return true;
             }
             if (ch == '\\') {
-                if (!unescape_one(buf, end, &r, &w)) return false;
+                if (!unescape_one(buf, end, &r, &w, &has_cr)) return false;
             } else {
+                if (ch == '\r') has_cr = 1;
                 buf[w++] = ch; r++;
             }
         }
-        if (chunk_end >= end) return false;
+        return false;
+    }
+}
+
+static bool parse_string_escaped(Cur *c, size_t start, size_t first_esc, Sp *out, uint8_t *has_cr_out) {
+    if (g_has_avx2) return parse_string_escaped_avx2(c, start, first_esc, out, has_cr_out);
+    uint8_t *buf = c->pool->base;
+    size_t end = c->end;
+    size_t w = first_esc, r = first_esc;
+    uint8_t has_cr = 0;
+    if (has_cr_out) {
+        for (size_t k = start; k < first_esc; k++) if (buf[k] == '\r') { has_cr = 1; break; }
+    }
+    __m128i vq = _mm_set1_epi8('"');
+    __m128i vbs = _mm_set1_epi8('\\');
+    __m128i vcr = _mm_set1_epi8('\r');
+    __m128i any_cr = _mm_setzero_si128();
+    for (;;) {
+        while (r + 16 <= end) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(buf + r));
+            if (has_cr_out) any_cr = _mm_or_si128(any_cr, _mm_cmpeq_epi8(v, vcr));
+            uint32_t m = (uint32_t)_mm_movemask_epi8(
+                _mm_or_si128(_mm_cmpeq_epi8(v, vq), _mm_cmpeq_epi8(v, vbs)));
+            if (m == 0) {
+                _mm_storeu_si128((__m128i *)(buf + w), v);
+                w += 16; r += 16;
+                continue;
+            }
+            size_t k = (size_t)__builtin_ctz(m);
+            if (k > 0) { copy_fwd_lt32(buf + w, buf + r, k); w += k; r += k; }
+            if (buf[r] == '"') {
+                c->pos = r + 1;
+                *out = (Sp){(uint32_t)start, (uint32_t)(w - start)};
+                if (has_cr_out) *has_cr_out = (uint8_t)(has_cr | (_mm_movemask_epi8(any_cr) != 0));
+                return true;
+            }
+            if (!unescape_one(buf, end, &r, &w, &has_cr)) return false;
+        }
+        while (r < end) {
+            uint8_t ch = buf[r];
+            if (ch == '"') {
+                c->pos = r + 1;
+                *out = (Sp){(uint32_t)start, (uint32_t)(w - start)};
+                if (has_cr_out) *has_cr_out = (uint8_t)(has_cr | (_mm_movemask_epi8(any_cr) != 0));
+                return true;
+            }
+            if (ch == '\\') {
+                if (!unescape_one(buf, end, &r, &w, &has_cr)) return false;
+            } else {
+                if (ch == '\r') has_cr = 1;
+                buf[w++] = ch; r++;
+            }
+        }
+        return false;
     }
 }
 
@@ -306,6 +424,7 @@ bool json_read_case(Cur *c, CaseInput *out) {
                 if (cur_peek(c) == ']') { c->pos++; break; }
                 if (!cur_byte(c, '{')) return false;
                 Sp path = SP_NONE, content = SP_NONE;
+                uint8_t has_cr = 0;
                 for (;;) {
                     cur_ws(c);
                     if (cur_peek(c) == '}') { c->pos++; break; }
@@ -316,7 +435,7 @@ bool json_read_case(Cur *c, CaseInput *out) {
                     if (fk.len == 4 && cmp_bytes(fkb, "path", 4) == 0) {
                         if (!parse_string(c, &path)) return false;
                     } else if (fk.len == 7 && cmp_bytes(fkb, "content", 7) == 0) {
-                        if (!parse_string(c, &content)) return false;
+                        if (!parse_string_ex(c, &content, &has_cr)) return false;
                     } else {
                         if (!skip_value(c)) return false;
                     }
@@ -326,7 +445,7 @@ bool json_read_case(Cur *c, CaseInput *out) {
                     return false;
                 }
                 SpPair *pr = arr_slot(&out->files, c->pool);
-                pr->a = path; pr->b = content;
+                pr->a = path; pr->b = content; pr->has_cr = has_cr;
                 cur_ws(c);
                 if (cur_peek(c) == ',') { c->pos++; continue; }
                 if (cur_peek(c) == ']') { c->pos++; break; }

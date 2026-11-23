@@ -1,7 +1,32 @@
-/* core.c — freestanding runtime: raw syscalls, mmap allocator, the
- * bump pool, generic arrays, byte strings, SSE2 scans.
+/* core.c — freestanding runtime: raw syscalls, mmap/THP allocator, the
+ * bump pool, generic arrays, byte strings, runtime-dispatched AVX2 / SSE2 scans.
  * No libc: every byte we need comes from a raw syscall. */
 #include "zg.h"
+#include <immintrin.h>
+
+uint8_t g_has_avx2 = 0;
+uint8_t g_has_popcnt = 0;
+
+void cpu_detect(void) {
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+    uint32_t max_leaf = eax;
+    if (max_leaf < 1) return;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+    if (ecx & (1u << 23)) g_has_popcnt = 1;
+    bool osxsave = (ecx & (1u << 27)) != 0;
+    bool avx = (ecx & (1u << 28)) != 0;
+    if (osxsave && avx && max_leaf >= 7) {
+        uint32_t xlo, xhi;
+        __asm__ volatile("xgetbv" : "=a"(xlo), "=d"(xhi) : "c"(0));
+        if ((xlo & 6u) == 6u) {
+            __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
+            if ((ebx & (1u << 5)) && (ebx & (1u << 3))) {
+                g_has_avx2 = 1;
+            }
+        }
+    }
+}
 
 /* ---------------- raw syscalls ---------------- */
 long raw_call(long n, long a, long b, long c, long d, long e, long f) {
@@ -28,71 +53,182 @@ void *os_map(long n) {
     return (void *)r;
 }
 
+/* Map with 2MB alignment + MADV_HUGEPAGE hint for big arena pools. */
+void *os_map_huge(size_t n) {
+    size_t align = 1u << 21; /* 2 MB */
+    size_t total = n + align;
+    void *raw = os_map((long)total);
+    if (!raw) return 0;
+    uintptr_t addr = ((uintptr_t)raw + align - 1) & ~(align - 1);
+    /* SYS_madvise = 28, MADV_HUGEPAGE = 14 (harmless if unsupported) */
+    raw_call(28, (long)addr, (long)n, 14, 0, 0, 0);
+    return (void *)addr;
+}
+
 void *os_alloc(size_t n) {
     size_t pages = (n + 4095) / 4096;
     return os_map((long)(pages * 4096));
 }
 
 /* ---------------- byte primitives (also satisfy gcc codegen) ---------------- */
+__attribute__((target("avx2")))
+static void copy_bytes_avx2(uint8_t *dd, const uint8_t *ss, size_t n) {
+    while (n >= 64) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)ss);
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(ss + 32));
+        _mm256_storeu_si256((__m256i *)dd, v0);
+        _mm256_storeu_si256((__m256i *)(dd + 32), v1);
+        dd += 64; ss += 64; n -= 64;
+    }
+    if (n >= 32) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)ss);
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(ss + n - 32));
+        _mm256_storeu_si256((__m256i *)dd, v0);
+        _mm256_storeu_si256((__m256i *)(dd + n - 32), v1);
+        return;
+    }
+    if (n >= 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)ss);
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(ss + n - 16));
+        _mm_storeu_si128((__m128i *)dd, v0);
+        _mm_storeu_si128((__m128i *)(dd + n - 16), v1);
+        return;
+    }
+    if (n >= 8) {
+        uint64_t a, b;
+        __builtin_memcpy(&a, ss, 8); __builtin_memcpy(&b, ss + n - 8, 8);
+        __builtin_memcpy(dd, &a, 8); __builtin_memcpy(dd + n - 8, &b, 8);
+        return;
+    }
+    if (n >= 4) {
+        uint32_t a, b;
+        __builtin_memcpy(&a, ss, 4); __builtin_memcpy(&b, ss + n - 4, 4);
+        __builtin_memcpy(dd, &a, 4); __builtin_memcpy(dd + n - 4, &b, 4);
+        return;
+    }
+    if (n >= 2) {
+        uint16_t a, b;
+        __builtin_memcpy(&a, ss, 2); __builtin_memcpy(&b, ss + n - 2, 2);
+        __builtin_memcpy(dd, &a, 2); __builtin_memcpy(dd + n - 2, &b, 2);
+        return;
+    }
+    if (n == 1) *dd = *ss;
+}
+
 void *copy_bytes(void *d, const void *s, size_t n) {
     uint8_t *dd = d; const uint8_t *ss = s;
-    while (n >= 8) {
-        *(uint64_t *)dd = *(const uint64_t *)ss; dd += 8; ss += 8; n -= 8;
+    if (n >= 64 && g_has_avx2) {
+        copy_bytes_avx2(dd, ss, n);
+        return d;
     }
-    while (n--) *dd++ = *ss++;
+    if (n >= 32) {
+        while (n >= 32) {
+            __m128i v0 = _mm_loadu_si128((const __m128i *)ss);
+            __m128i v1 = _mm_loadu_si128((const __m128i *)(ss + 16));
+            _mm_storeu_si128((__m128i *)dd, v0);
+            _mm_storeu_si128((__m128i *)(dd + 16), v1);
+            dd += 32; ss += 32; n -= 32;
+        }
+    }
+    if (n >= 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)ss);
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(ss + n - 16));
+        _mm_storeu_si128((__m128i *)dd, v0);
+        _mm_storeu_si128((__m128i *)(dd + n - 16), v1);
+        return d;
+    }
+    if (n >= 8) {
+        uint64_t a, b;
+        __builtin_memcpy(&a, ss, 8); __builtin_memcpy(&b, ss + n - 8, 8);
+        __builtin_memcpy(dd, &a, 8); __builtin_memcpy(dd + n - 8, &b, 8);
+        return d;
+    }
+    if (n >= 4) {
+        uint32_t a, b;
+        __builtin_memcpy(&a, ss, 4); __builtin_memcpy(&b, ss + n - 4, 4);
+        __builtin_memcpy(dd, &a, 4); __builtin_memcpy(dd + n - 4, &b, 4);
+        return d;
+    }
+    if (n >= 2) {
+        uint16_t a, b;
+        __builtin_memcpy(&a, ss, 2); __builtin_memcpy(&b, ss + n - 2, 2);
+        __builtin_memcpy(dd, &a, 2); __builtin_memcpy(dd + n - 2, &b, 2);
+        return d;
+    }
+    if (n == 1) *dd = *ss;
     return d;
 }
 
 void *fill_bytes(void *d, int c, size_t n) {
     uint8_t *dd = d; uint8_t v = (uint8_t)c;
+    if (n >= 16) {
+        __m128i vv = _mm_set1_epi8((char)v);
+        while (n >= 32) {
+            _mm_storeu_si128((__m128i *)dd, vv);
+            _mm_storeu_si128((__m128i *)(dd + 16), vv);
+            dd += 32; n -= 32;
+        }
+        if (n >= 16) {
+            _mm_storeu_si128((__m128i *)dd, vv);
+            _mm_storeu_si128((__m128i *)(dd + n - 16), vv);
+            return d;
+        }
+    }
     uint64_t w = (uint64_t)v * 0x0101010101010101ull;
-    while (n >= 8) { *(uint64_t *)dd = w; dd += 8; n -= 8; }
+    while (n >= 8) { __builtin_memcpy(dd, &w, 8); dd += 8; n -= 8; }
     while (n--) *dd++ = v;
     return d;
 }
 
 int cmp_bytes(const void *a, const void *b, size_t n) {
     const uint8_t *x = a, *y = b;
+    while (n >= 16) {
+        __m128i vx = _mm_loadu_si128((const __m128i *)x);
+        __m128i vy = _mm_loadu_si128((const __m128i *)y);
+        unsigned m = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(vx, vy)) ^ 0xffffu;
+        if (m) {
+            int idx = __builtin_ctz(m);
+            return (int)x[idx] - (int)y[idx];
+        }
+        x += 16; y += 16; n -= 16;
+    }
+    while (n >= 8) {
+        uint64_t u, v;
+        __builtin_memcpy(&u, x, 8); __builtin_memcpy(&v, y, 8);
+        if (u != v) {
+            int idx = __builtin_ctzll(u ^ v) >> 3;
+            return (int)x[idx] - (int)y[idx];
+        }
+        x += 8; y += 8; n -= 8;
+    }
     while (n--) { if (*x != *y) return (int)*x - (int)*y; x++; y++; }
     return 0;
 }
 
-void *memcpy(void *d, const void *s, size_t n) { return copy_bytes(d, s, n); }
-void *memset(void *d, int c, size_t n) { return fill_bytes(d, c, n); }
-void *memmove(void *d, const void *s, size_t n) {
+__attribute__((used)) void *memcpy(void *d, const void *s, size_t n) { return copy_bytes(d, s, n); }
+__attribute__((used)) void *memset(void *d, int c, size_t n) { return fill_bytes(d, c, n); }
+__attribute__((used)) void *memmove(void *d, const void *s, size_t n) {
     uint8_t *dd = d; const uint8_t *ss = s;
     if (dd < ss) return copy_bytes(d, s, n);
     dd += n; ss += n;
     while (n--) *--dd = *--ss;
     return d;
 }
-int memcmp(const void *a, const void *b, size_t n) { return cmp_bytes(a, b, n); }
-size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
+__attribute__((used)) int memcmp(const void *a, const void *b, size_t n) { return cmp_bytes(a, b, n); }
+__attribute__((used)) size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 
 /* ---------------- bump pool ---------------- */
 void pool_open(Pool *p, size_t cap) {
-    p->base = os_map((long)cap);
+    p->base = os_map_huge(cap);
     p->len = 0;
     p->cap = cap;
-}
-
-void pool_put(Pool *p, const uint8_t *src, size_t n) {
-    copy_bytes(p->base + p->len, src, n);
-    p->len += n;
-}
-
-void pool_copy(Pool *p, Sp s) {
-    /* Source ends at or before the tail (spans were created earlier),
-     * so the source region lies entirely before the destination. */
-    copy_bytes(p->base + p->len, p->base + s.off, s.len);
-    p->len += s.len;
 }
 
 void pool_u64(Pool *p, uint64_t v) {
     uint8_t tmp[20]; int i = 20;
     if (v == 0) { p->base[p->len++] = '0'; return; }
     while (v > 0) { tmp[--i] = (uint8_t)('0' + v % 10); v /= 10; }
-    copy_bytes(p->base + p->len, tmp + i, (size_t)(20 - i));
+    copy_fast(p->base + p->len, tmp + i, (size_t)(20 - i));
     p->len += (size_t)(20 - i);
 }
 
@@ -106,16 +242,7 @@ void pool_i64(Pool *p, int64_t n) {
     pool_u64(p, (uint64_t)n);
 }
 
-Sp pool_store(Pool *p, const uint8_t *src, size_t n) {
-    uint32_t off = (uint32_t)p->len;
-    copy_bytes(p->base + p->len, src, n);
-    p->len += n;
-    return (Sp){off, (uint32_t)n};
-}
-
 /* ---------------- generic array ---------------- */
-void arr_new(Arr *a, size_t esz) { a->items = 0; a->len = 0; a->cap = 0; a->esz = esz; }
-
 void arr_grow(Arr *a, Pool *p, size_t n) {
     if (n <= a->cap) return;
     size_t ncap = a->cap ? a->cap * 2 : 16;
@@ -126,27 +253,17 @@ void arr_grow(Arr *a, Pool *p, size_t n) {
     a->cap = ncap;
 }
 
-void *arr_slot(Arr *a, Pool *p) {
-    arr_grow(a, p, a->len + 1);
-    void *slot = (uint8_t *)a->items + a->len * a->esz;
-    fill_bytes(slot, 0, a->esz);
-    a->len++;
-    return slot;
-}
-
-void *arr_at(Arr *a, size_t i) { return (uint8_t *)a->items + i * a->esz; }
-
 /* Stable mergesort over an array's elements. */
 static void sort_merge(uint8_t *a, uint8_t *tmp, size_t esz, size_t lo, size_t mid, size_t hi,
                        void *ctx, int (*cmp)(void *, const void *, const void *)) {
     size_t i = lo, j = mid, k = lo;
     while (i < mid && j < hi) {
-        if (cmp(ctx, a + i * esz, a + j * esz) <= 0) { copy_bytes(tmp + k * esz, a + i * esz, esz); i++; }
-        else { copy_bytes(tmp + k * esz, a + j * esz, esz); j++; }
+        if (cmp(ctx, a + i * esz, a + j * esz) <= 0) { copy_fast(tmp + k * esz, a + i * esz, esz); i++; }
+        else { copy_fast(tmp + k * esz, a + j * esz, esz); j++; }
         k++;
     }
-    while (i < mid) { copy_bytes(tmp + k * esz, a + i * esz, esz); i++; k++; }
-    while (j < hi) { copy_bytes(tmp + k * esz, a + j * esz, esz); j++; k++; }
+    if (i < mid) copy_bytes(tmp + k * esz, a + i * esz, (mid - i) * esz);
+    if (j < hi) copy_bytes(tmp + k * esz, a + j * esz, (hi - j) * esz);
     copy_bytes(a + lo * esz, tmp + lo * esz, (hi - lo) * esz);
 }
 
@@ -166,32 +283,14 @@ void arr_sort(Arr *a, Pool *p, void *ctx, int (*cmp)(void *ctx, const void *x, c
 }
 
 /* ---------------- byte string (mmap-backed) ---------------- */
-void str_new(Str *s) { s->data = 0; s->len = 0; s->cap = 0; }
-
 void str_grow(Str *s, size_t n) {
     if (n <= s->cap) return;
-    size_t ncap = s->cap ? s->cap * 2 : 512;
+    size_t ncap = s->cap ? s->cap * 2 : 4096;
     while (ncap < n) ncap *= 2;
     uint8_t *np = os_alloc(ncap);
     if (s->data && s->len) copy_bytes(np, s->data, s->len);
     s->data = np;
     s->cap = ncap;
-}
-
-void str_c(Str *s, uint8_t c) {
-    str_grow(s, s->len + 1);
-    s->data[s->len++] = c;
-}
-
-void str_add(Str *s, const uint8_t *p, size_t n) {
-    str_grow(s, s->len + n);
-    copy_bytes(s->data + s->len, p, n);
-    s->len += n;
-}
-
-void str_cstr(Str *s, const char *t) {
-    size_t n = 0; while (t[n]) n++;
-    str_add(s, (const uint8_t *)t, n);
 }
 
 void str_i64(Str *s, int64_t n) {
@@ -210,26 +309,116 @@ void str_i64(Str *s, int64_t n) {
     str_add(s, tmp + i, (size_t)(20 - i));
 }
 
-/* ---------------- SSE2 scans ---------------- */
-static inline unsigned mask16(__m128i v) { return (unsigned)_mm_movemask_epi8(v); }
+/* ---------------- SIMD scans (AVX2 + SSE2 fallback) ---------------- */
 
-static inline int first_bit(unsigned m, size_t base) {
-    int off = 0;
-    while ((m & 1) == 0) { m >>= 1; off++; }
-    return (int)(base + (size_t)off);
+static const uint8_t TBL_INLINE[256] = {
+    ['\\'] = 1, ['`'] = 1, ['['] = 1, ['*'] = 1,
+    ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1
+};
+static const uint8_t TBL_INLINE_JSON[256] = {
+    [0 ... 0x1f] = 1,
+    ['\\'] = 1, ['`'] = 1, ['['] = 1, ['*'] = 1,
+    ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1
+};
+static const uint8_t TBL_HTML[256] = {
+    ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1
+};
+static const uint8_t TBL_HTML_JSON[256] = {
+    [0 ... 0x1f] = 1,
+    ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1, ['\\'] = 1
+};
+static const uint8_t TBL_JSON[256] = {
+    [0 ... 0x1f] = 1, ['"'] = 1, ['\\'] = 1
+};
+
+__attribute__((target("avx2,bmi")))
+static int scan_byte_avx2(const uint8_t *b, size_t n, size_t i, uint8_t c) {
+    __m256i vc = _mm256_set1_epi8((char)c);
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vc));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm256_castsi256_si128(vc)));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (b[i] == c) return (int)i; i++; }
+    return -1;
+}
+
+int scan_byte(const uint8_t *b, size_t n, size_t from, uint8_t c) {
+    if (g_has_avx2 && n - from >= 32) return scan_byte_avx2(b, n, from, c);
+    size_t i = from;
+    __m128i vc = _mm_set1_epi8((char)c);
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, vc));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (b[i] == c) return (int)i; i++; }
+    return -1;
+}
+
+int scan_nl(const uint8_t *b, size_t n, size_t from) {
+    return scan_byte(b, n, from, 10);
+}
+
+__attribute__((target("avx2,bmi")))
+static int scan_two_avx2(const uint8_t *b, size_t n, size_t i, uint8_t c1, uint8_t c2) {
+    __m256i v1 = _mm256_set1_epi8((char)c1);
+    __m256i v2 = _mm256_set1_epi8((char)c2);
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i hit = _mm256_or_si256(_mm256_cmpeq_epi8(v, v1), _mm256_cmpeq_epi8(v, v2));
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i hit = _mm_or_si128(_mm_cmpeq_epi8(v, _mm256_castsi256_si128(v1)),
+                                   _mm_cmpeq_epi8(v, _mm256_castsi256_si128(v2)));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (b[i] == c1 || b[i] == c2) return (int)i; i++; }
+    return -1;
+}
+
+int scan_two(const uint8_t *b, size_t n, size_t from, uint8_t c1, uint8_t c2) {
+    if (g_has_avx2 && n - from >= 32) return scan_two_avx2(b, n, from, c1, c2);
+    size_t i = from;
+    __m128i v1 = _mm_set1_epi8((char)c1);
+    __m128i v2 = _mm_set1_epi8((char)c2);
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i hit = _mm_or_si128(_mm_cmpeq_epi8(v, v1), _mm_cmpeq_epi8(v, v2));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (b[i] == c1 || b[i] == c2) return (int)i; i++; }
+    return -1;
 }
 
 int scan_any(const uint8_t *b, size_t n, size_t from, const uint8_t *needles, size_t nneedles) {
-    /* Broadcast the needle vectors ONCE: gcc does not hoist the
-     * broadcast out of the chunk loop (the needles may alias input). */
+    if (nneedles == 1) return scan_byte(b, n, from, needles[0]);
+    if (nneedles == 2) return scan_two(b, n, from, needles[0], needles[1]);
     __m128i vec[16];
     for (size_t k = 0; k < nneedles; k++) vec[k] = _mm_set1_epi8((char)needles[k]);
     size_t i = from;
     while (i + 16 <= n) {
         __m128i chunk = _mm_loadu_si128((const __m128i *)(b + i));
-        unsigned m = 0;
-        for (size_t k = 0; k < nneedles; k++) m |= mask16(_mm_cmpeq_epi8(chunk, vec[k]));
-        if (m) return first_bit(m, i);
+        __m128i hit = _mm_setzero_si128();
+        for (size_t k = 0; k < nneedles; k++) hit = _mm_or_si128(hit, _mm_cmpeq_epi8(chunk, vec[k]));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
         i += 16;
     }
     while (i < n) {
@@ -239,63 +428,259 @@ int scan_any(const uint8_t *b, size_t n, size_t from, const uint8_t *needles, si
     return -1;
 }
 
+__attribute__((target("avx2,bmi")))
+static int scan_json_esc_avx2(const uint8_t *b, size_t n, size_t i) {
+    __m256i q = _mm256_set1_epi8('"');
+    __m256i bs = _mm256_set1_epi8('\\');
+    __m256i c1f = _mm256_set1_epi8(0x1f);
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i hit = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, q), _mm256_cmpeq_epi8(v, bs)),
+            _mm256_cmpeq_epi8(_mm256_min_epu8(v, c1f), v));
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i hit = _mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(v, _mm256_castsi256_si128(q)),
+                         _mm_cmpeq_epi8(v, _mm256_castsi256_si128(bs))),
+            _mm_cmpeq_epi8(_mm_min_epu8(v, _mm256_castsi256_si128(c1f)), v));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (TBL_JSON[b[i]]) return (int)i; i++; }
+    return -1;
+}
+
 int scan_json_esc(const uint8_t *b, size_t n, size_t from) {
+    if (g_has_avx2 && n - from >= 32) return scan_json_esc_avx2(b, n, from);
     size_t i = from;
     __m128i q = _mm_set1_epi8('"');
     __m128i bs = _mm_set1_epi8('\\');
-    __m128i x80 = _mm_set1_epi8((char)0x80);
-    __m128i lt = _mm_set1_epi8((char)0xa0); /* (0x20 ^ 0x80) as signed */
+    __m128i c1f = _mm_set1_epi8(0x1f);
     while (i + 16 <= n) {
-        __m128i chunk = _mm_loadu_si128((const __m128i *)(b + i));
-        unsigned m = mask16(_mm_cmpeq_epi8(chunk, q)) | mask16(_mm_cmpeq_epi8(chunk, bs))
-            | mask16(_mm_cmplt_epi8(_mm_xor_si128(chunk, x80), lt));
-        if (m) return first_bit(m, i);
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i hit = _mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(v, q), _mm_cmpeq_epi8(v, bs)),
+            _mm_cmpeq_epi8(_mm_min_epu8(v, c1f), v));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
         i += 16;
     }
-    while (i < n) {
-        uint8_t c = b[i];
-        if (c == '"' || c == '\\' || c < 0x20) return (int)i;
-        i++;
+    while (i < n) { if (TBL_JSON[b[i]]) return (int)i; i++; }
+    return -1;
+}
+
+__attribute__((target("avx2,bmi")))
+static int scan_html_esc_avx2(const uint8_t *b, size_t n, size_t i) {
+    /* Needles: " (22), & (26), ' (27), < (3C), > (3E) */
+    __m256i lo_lut = _mm256_setr_epi8(
+        0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 2, 0, 2, 0,
+        0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 2, 0, 2, 0);
+    __m256i hi_lut = _mm256_setr_epi8(
+        0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m256i mask0f = _mm256_set1_epi8(0x0f);
+    __m256i zero = _mm256_setzero_si256();
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i lo = _mm256_shuffle_epi8(lo_lut, v);
+        __m256i hi = _mm256_shuffle_epi8(hi_lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), mask0f));
+        __m256i hit = _mm256_and_si256(lo, hi);
+        uint32_t m = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, zero));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 32;
     }
+    while (i < n) { if (TBL_HTML[b[i]]) return (int)i; i++; }
     return -1;
 }
 
 int scan_html_esc(const uint8_t *b, size_t n, size_t from) {
-    static const uint8_t needles[5] = {'&', '<', '>', '"', '\''};
-    return scan_any(b, n, from, needles, 5);
-}
-
-int scan_nl(const uint8_t *b, size_t n, size_t from) {
+    if (g_has_avx2 && n - from >= 32) return scan_html_esc_avx2(b, n, from);
     size_t i = from;
-    __m128i nl = _mm_set1_epi8(10);
+    __m128i v0 = _mm_set1_epi8('&'), v1 = _mm_set1_epi8('<'), v2 = _mm_set1_epi8('>'),
+            v3 = _mm_set1_epi8('"'), v4 = _mm_set1_epi8('\'');
     while (i + 16 <= n) {
-        __m128i chunk = _mm_loadu_si128((const __m128i *)(b + i));
-        unsigned m = mask16(_mm_cmpeq_epi8(chunk, nl));
-        if (m) return first_bit(m, i);
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i hit = _mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(v, v0), _mm_cmpeq_epi8(v, v1)),
+            _mm_or_si128(_mm_cmpeq_epi8(v, v2),
+                         _mm_or_si128(_mm_cmpeq_epi8(v, v3), _mm_cmpeq_epi8(v, v4))));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
         i += 16;
     }
-    while (i < n) { if (b[i] == 10) return (int)i; i++; }
+    while (i < n) { if (TBL_HTML[b[i]]) return (int)i; i++; }
+    return -1;
+}
+
+__attribute__((target("avx2,bmi")))
+static int scan_inline_md_avx2(const uint8_t *b, size_t n, size_t i) {
+    /* Needles: " (22), & (26), ' (27), * (2A), < (3C), > (3E), [ (5B), \ (5C), ` (60) */
+    __m256i lo_lut = _mm256_setr_epi8(
+        8, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 4, 6, 0, 2, 0,
+        8, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 4, 6, 0, 2, 0);
+    __m256i hi_lut = _mm256_setr_epi8(
+        0, 0, 1, 2, 0, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 1, 2, 0, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m256i mask0f = _mm256_set1_epi8(0x0f);
+    __m256i zero = _mm256_setzero_si256();
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i lo = _mm256_shuffle_epi8(lo_lut, v);
+        __m256i hi = _mm256_shuffle_epi8(hi_lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), mask0f));
+        __m256i hit = _mm256_and_si256(lo, hi);
+        uint32_t m = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, zero));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i lo = _mm_shuffle_epi8(_mm256_castsi256_si128(lo_lut), v);
+        __m128i hi = _mm_shuffle_epi8(_mm256_castsi256_si128(hi_lut),
+                                      _mm_and_si128(_mm_srli_epi16(v, 4), _mm256_castsi256_si128(mask0f)));
+        __m128i hit = _mm_and_si128(lo, hi);
+        uint32_t m = ((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hit, _mm_setzero_si128()))) ^ 0xffffu;
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (TBL_INLINE[b[i]]) return (int)i; i++; }
+    return -1;
+}
+
+int scan_inline_md(const uint8_t *b, size_t n, size_t from) {
+    if (g_has_avx2 && n - from >= 16) return scan_inline_md_avx2(b, n, from);
+    size_t i = from;
+    __m128i v0 = _mm_set1_epi8('\\'), v1 = _mm_set1_epi8('`'), v2 = _mm_set1_epi8('['),
+            v3 = _mm_set1_epi8('*'), v4 = _mm_set1_epi8('&'), v5 = _mm_set1_epi8('<'),
+            v6 = _mm_set1_epi8('>'), v7 = _mm_set1_epi8('"'), v8 = _mm_set1_epi8('\'');
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i h1 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, v0), _mm_cmpeq_epi8(v, v1)),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, v2), _mm_cmpeq_epi8(v, v3)));
+        __m128i h2 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, v4), _mm_cmpeq_epi8(v, v5)),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, v6),
+                                               _mm_or_si128(_mm_cmpeq_epi8(v, v7), _mm_cmpeq_epi8(v, v8))));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_or_si128(h1, h2));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (TBL_INLINE[b[i]]) return (int)i; i++; }
+    return -1;
+}
+
+__attribute__((target("avx2,bmi")))
+static int scan_inline_md_json_avx2(const uint8_t *b, size_t n, size_t i) {
+    /* Needles: 0x00..0x1f (hi=0,1 -> 1), " (22), & (26), ' (27), * (2A) (hi=2 -> 2),
+     * < (3C), > (3E) (hi=3 -> 4), [ (5B), \ (5C) (hi=5 -> 8), ` (60) (hi=6 -> 16) */
+    __m256i lo_lut = _mm256_setr_epi8(
+        17, 1, 3, 1, 1, 1, 3, 3, 1, 1, 3, 9, 13, 1, 5, 1,
+        17, 1, 3, 1, 1, 1, 3, 3, 1, 1, 3, 9, 13, 1, 5, 1);
+    __m256i hi_lut = _mm256_setr_epi8(
+        1, 1, 2, 4, 0, 8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 2, 4, 0, 8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m256i mask0f = _mm256_set1_epi8(0x0f);
+    __m256i zero = _mm256_setzero_si256();
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i lo = _mm256_shuffle_epi8(lo_lut, v);
+        __m256i hi = _mm256_shuffle_epi8(hi_lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), mask0f));
+        __m256i hit = _mm256_and_si256(lo, hi);
+        uint32_t m = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, zero));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i lo = _mm_shuffle_epi8(_mm256_castsi256_si128(lo_lut), v);
+        __m128i hi = _mm_shuffle_epi8(_mm256_castsi256_si128(hi_lut),
+                                      _mm_and_si128(_mm_srli_epi16(v, 4), _mm256_castsi256_si128(mask0f)));
+        __m128i hit = _mm_and_si128(lo, hi);
+        uint32_t m = ((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hit, _mm_setzero_si128()))) ^ 0xffffu;
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (TBL_INLINE_JSON[b[i]]) return (int)i; i++; }
+    return -1;
+}
+
+int scan_inline_md_json(const uint8_t *b, size_t n, size_t from) {
+    if (g_has_avx2 && n - from >= 16) return scan_inline_md_json_avx2(b, n, from);
+    size_t i = from;
+    __m128i c1f = _mm_set1_epi8(0x1f);
+    __m128i v0 = _mm_set1_epi8('\\'), v1 = _mm_set1_epi8('`'), v2 = _mm_set1_epi8('['),
+            v3 = _mm_set1_epi8('*'), v4 = _mm_set1_epi8('&'), v5 = _mm_set1_epi8('<'),
+            v6 = _mm_set1_epi8('>'), v7 = _mm_set1_epi8('"'), v8 = _mm_set1_epi8('\'');
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i h0 = _mm_cmpeq_epi8(_mm_min_epu8(v, c1f), v);
+        __m128i h1 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, v0), _mm_cmpeq_epi8(v, v1)),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, v2), _mm_cmpeq_epi8(v, v3)));
+        __m128i h2 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, v4), _mm_cmpeq_epi8(v, v5)),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, v6),
+                                               _mm_or_si128(_mm_cmpeq_epi8(v, v7), _mm_cmpeq_epi8(v, v8))));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_or_si128(h0, _mm_or_si128(h1, h2)));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (TBL_INLINE_JSON[b[i]]) return (int)i; i++; }
+    return -1;
+}
+
+__attribute__((target("avx2,bmi")))
+static int scan_html_json_esc_avx2(const uint8_t *b, size_t n, size_t i) {
+    /* Needles: 0x00..0x1f (hi=0,1 -> 8), " (22), & (26), ' (27) (hi=2 -> 1), < (3C), > (3E) (hi=3 -> 2), \ (5C) (hi=5 -> 4) */
+    __m256i lo_lut = _mm256_setr_epi8(
+        8, 8, 9, 8, 8, 8, 9, 9, 8, 8, 8, 8, 14, 8, 10, 8,
+        8, 8, 9, 8, 8, 8, 9, 9, 8, 8, 8, 8, 14, 8, 10, 8);
+    __m256i hi_lut = _mm256_setr_epi8(
+        8, 8, 1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        8, 8, 1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m256i mask0f = _mm256_set1_epi8(0x0f);
+    __m256i zero = _mm256_setzero_si256();
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i lo = _mm256_shuffle_epi8(lo_lut, v);
+        __m256i hi = _mm256_shuffle_epi8(hi_lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), mask0f));
+        __m256i hit = _mm256_and_si256(lo, hi);
+        uint32_t m = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, zero));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 32;
+    }
+    if (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i lo = _mm_shuffle_epi8(_mm256_castsi256_si128(lo_lut), v);
+        __m128i hi = _mm_shuffle_epi8(_mm256_castsi256_si128(hi_lut),
+                                      _mm_and_si128(_mm_srli_epi16(v, 4), _mm256_castsi256_si128(mask0f)));
+        __m128i hit = _mm_and_si128(lo, hi);
+        uint32_t m = ((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hit, _mm_setzero_si128()))) ^ 0xffffu;
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
+        i += 16;
+    }
+    while (i < n) { if (TBL_HTML_JSON[b[i]]) return (int)i; i++; }
     return -1;
 }
 
 int scan_html_json_esc(const uint8_t *b, size_t n, size_t from) {
+    if (g_has_avx2 && n - from >= 16) return scan_html_json_esc_avx2(b, n, from);
     size_t i = from;
-    __m128i x80 = _mm_set1_epi8((char)0x80);
-    __m128i lt = _mm_set1_epi8((char)0xa0);
-    static const uint8_t needles[6] = {'&', '<', '>', '"', '\'', '\\'};
-    __m128i vec[6];
-    for (size_t k = 0; k < 6; k++) vec[k] = _mm_set1_epi8((char)needles[k]);
+    __m128i c1f = _mm_set1_epi8(0x1f);
+    __m128i v0 = _mm_set1_epi8('&'), v1 = _mm_set1_epi8('<'), v2 = _mm_set1_epi8('>'),
+            v3 = _mm_set1_epi8('"'), v4 = _mm_set1_epi8('\''), v5 = _mm_set1_epi8('\\');
     while (i + 16 <= n) {
-        __m128i chunk = _mm_loadu_si128((const __m128i *)(b + i));
-        unsigned m = mask16(_mm_cmplt_epi8(_mm_xor_si128(chunk, x80), lt));
-        for (size_t k = 0; k < 6; k++) m |= mask16(_mm_cmpeq_epi8(chunk, vec[k]));
-        if (m) return first_bit(m, i);
+        __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i h1 = _mm_or_si128(_mm_cmpeq_epi8(_mm_min_epu8(v, c1f), v),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, v0), _mm_cmpeq_epi8(v, v1)));
+        __m128i h2 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, v2), _mm_cmpeq_epi8(v, v3)),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, v4), _mm_cmpeq_epi8(v, v5)));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_or_si128(h1, h2));
+        if (m) return (int)(i + (size_t)__builtin_ctz(m));
         i += 16;
     }
-    while (i < n) {
-        uint8_t c = b[i];
-        if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\' || c < 0x20) return (int)i;
-        i++;
-    }
+    while (i < n) { if (TBL_HTML_JSON[b[i]]) return (int)i; i++; }
     return -1;
 }

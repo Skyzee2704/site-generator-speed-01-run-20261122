@@ -4,6 +4,7 @@
  * combines without validating continuation bytes or ranges). */
 #include "zg.h"
 #include "decomp.h"
+#include <immintrin.h>
 
 static const char *MONTH_NAMES[12] = {
     "January", "February", "March", "April", "May", "June", "July", "August",
@@ -164,6 +165,24 @@ static int decomp_into(uint32_t c, uint32_t buf[3]) {
     return (int)nfkd_find(c, buf);
 }
 
+static const uint8_t SLUG_ASCII[256] = {
+    ['0'] = '0', ['1'] = '1', ['2'] = '2', ['3'] = '3', ['4'] = '4',
+    ['5'] = '5', ['6'] = '6', ['7'] = '7', ['8'] = '8', ['9'] = '9',
+    ['A'] = 'a', ['B'] = 'b', ['C'] = 'c', ['D'] = 'd', ['E'] = 'e',
+    ['F'] = 'f', ['G'] = 'g', ['H'] = 'h', ['I'] = 'i', ['J'] = 'j',
+    ['K'] = 'k', ['L'] = 'l', ['M'] = 'm', ['N'] = 'n', ['O'] = 'o',
+    ['P'] = 'p', ['Q'] = 'q', ['R'] = 'r', ['S'] = 's', ['T'] = 't',
+    ['U'] = 'u', ['V'] = 'v', ['W'] = 'w', ['X'] = 'x', ['Y'] = 'y',
+    ['Z'] = 'z',
+    ['a'] = 'a', ['b'] = 'b', ['c'] = 'c', ['d'] = 'd', ['e'] = 'e',
+    ['f'] = 'f', ['g'] = 'g', ['h'] = 'h', ['i'] = 'i', ['j'] = 'j',
+    ['k'] = 'k', ['l'] = 'l', ['m'] = 'm', ['n'] = 'n', ['o'] = 'o',
+    ['p'] = 'p', ['q'] = 'q', ['r'] = 'r', ['s'] = 's', ['t'] = 't',
+    ['u'] = 'u', ['v'] = 'v', ['w'] = 'w', ['x'] = 'x', ['y'] = 'y',
+    ['z'] = 'z',
+    [0x80 ... 0xff] = 0xff
+};
+
 Sp slug_make(Pool *p, Sp text, Dict *cache) {
     const uint8_t *bytes = pool_at(p, text);
     Sp hit;
@@ -171,22 +190,24 @@ Sp slug_make(Pool *p, Sp text, Dict *cache) {
     uint32_t start = pool_mark(p);
     bool gap = false;
     bool ascii = true;
-    for (uint32_t i = 0; i < text.len; i++) if (bytes[i] >= 0x80) { ascii = false; break; }
-    if (ascii) {
-        for (uint32_t i = 0; i < text.len; i++) {
-            uint8_t b = bytes[i];
-            int keep = -1;
-            if (b >= 'A' && b <= 'Z') keep = b + 32;
-            else if ((b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')) keep = b;
-            if (keep >= 0) {
-                if (gap) pool_u8(p, '-');
-                gap = false;
-                pool_u8(p, (uint8_t)keep);
-            } else {
-                gap = p->len > start;
-            }
+    uint8_t *dst0 = p->base + start;
+    uint8_t *dst = dst0;
+    for (uint32_t i = 0; i < text.len; i++) {
+        uint8_t v = SLUG_ASCII[bytes[i]];
+        if (v == 0xff) { ascii = false; break; }
+        if (v) {
+            if (gap) *dst++ = '-';
+            gap = false;
+            *dst++ = v;
+        } else {
+            gap = dst > dst0;
         }
+    }
+    if (ascii) {
+        p->len = (size_t)(dst - p->base);
     } else {
+        p->len = start;
+        gap = false;
         size_t i = 0;
         while (i < text.len) {
             uint32_t c; size_t n = (size_t)u8_decode(bytes, text.len, i, &c); i += n;
@@ -249,7 +270,112 @@ static inline unsigned popcount16(uint16_t x) {
     return x;
 }
 
+__attribute__((target("avx2,popcnt")))
+static size_t word_count_avx2(const uint8_t *b, size_t n) {
+    size_t count = 0, i = 0;
+    bool in_word = false;
+    __m256i vsp = _mm256_set1_epi8(' ');
+    __m256i v8 = _mm256_set1_epi8(8);
+    __m256i v14 = _mm256_set1_epi8(14);
+    __m256i maskf0 = _mm256_set1_epi8((char)0xf0);
+    __m256i ve0 = _mm256_set1_epi8((char)0xe0);
+    __m256i vc2 = _mm256_set1_epi8((char)0xc2);
+    while (i + 64 <= n) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(b + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(b + i + 32));
+        if (__builtin_expect(_mm256_movemask_epi8(_mm256_or_si256(v0, v1)) != 0, 0)) {
+            __m256i sp0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, vc2),
+                                          _mm256_cmpeq_epi8(_mm256_and_si256(v0, maskf0), ve0));
+            __m256i sp1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, vc2),
+                                          _mm256_cmpeq_epi8(_mm256_and_si256(v1, maskf0), ve0));
+            if (_mm256_movemask_epi8(_mm256_or_si256(sp0, sp1)) != 0) {
+                size_t end = i + 64;
+                while (i < end) {
+                    uint8_t c0 = b[i];
+                    if (c0 < 0x80) {
+                        if (ws_byte(c0)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else if ((c0 & 0xc0) == 0x80) {
+                        if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else {
+                        uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
+                        if (u_is_space(c)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i += m;
+                    }
+                }
+                continue;
+            }
+        }
+        __m256i w0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, vsp),
+            _mm256_and_si256(_mm256_cmpgt_epi8(v0, v8), _mm256_cmpgt_epi8(v14, v0)));
+        __m256i w1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, vsp),
+            _mm256_and_si256(_mm256_cmpgt_epi8(v1, v8), _mm256_cmpgt_epi8(v14, v1)));
+        uint64_t ws = (uint32_t)_mm256_movemask_epi8(w0) | ((uint64_t)(uint32_t)_mm256_movemask_epi8(w1) << 32);
+        uint64_t nonws = ~ws;
+        uint64_t prev = (ws << 1) | (in_word ? 0ULL : 1ULL);
+        count += (size_t)__builtin_popcountll(nonws & prev);
+        in_word = (ws >> 63) == 0;
+        i += 64;
+    }
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(b + i));
+        if (__builtin_expect(_mm256_movemask_epi8(v) != 0, 0)) {
+            __m256i sp = _mm256_or_si256(_mm256_cmpeq_epi8(v, vc2),
+                                         _mm256_cmpeq_epi8(_mm256_and_si256(v, maskf0), ve0));
+            if (_mm256_movemask_epi8(sp) != 0) {
+                size_t end = i + 32;
+                while (i < end) {
+                    uint8_t c0 = b[i];
+                    if (c0 < 0x80) {
+                        if (ws_byte(c0)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else if ((c0 & 0xc0) == 0x80) {
+                        if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else {
+                        uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
+                        if (u_is_space(c)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i += m;
+                    }
+                }
+                continue;
+            }
+        }
+        __m256i w = _mm256_or_si256(_mm256_cmpeq_epi8(v, vsp),
+            _mm256_and_si256(_mm256_cmpgt_epi8(v, v8), _mm256_cmpgt_epi8(v14, v)));
+        uint32_t ws = (uint32_t)_mm256_movemask_epi8(w);
+        uint32_t nonws = ~ws;
+        uint32_t prev = (ws << 1) | (in_word ? 0u : 1u);
+        count += (size_t)__builtin_popcount(nonws & prev);
+        in_word = (ws & 0x80000000u) == 0;
+        i += 32;
+    }
+    while (i < n) {
+        uint8_t c0 = b[i];
+        if (c0 < 0x80) {
+            if (ws_byte(c0)) in_word = false;
+            else if (!in_word) { in_word = true; count++; }
+            i++;
+        } else if ((c0 & 0xc0) == 0x80) {
+            if (!in_word) { in_word = true; count++; }
+            i++;
+        } else {
+            uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
+            if (u_is_space(c)) in_word = false;
+            else if (!in_word) { in_word = true; count++; }
+            i += m;
+        }
+    }
+    return count;
+}
+
 size_t word_count(const uint8_t *b, size_t n) {
+    if (g_has_avx2 && g_has_popcnt && n >= 32) return word_count_avx2(b, n);
     size_t count = 0, i = 0;
     bool in_word = false;
     /* SSE2 fast path: 16 bytes at a time while the chunk is all ASCII.
@@ -333,7 +459,121 @@ void json_escape_into(Pool *p, const uint8_t *bytes, size_t n) {
     }
 }
 
+__attribute__((target("avx2,bmi")))
+static void html_json_escape_into_avx2(Pool *p, const uint8_t *bytes, size_t n) {
+    static const char HEX[] = "0123456789abcdef";
+    static const uint8_t TBL[256] = {
+        [0 ... 0x1f] = 1,
+        ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1, ['\\'] = 1
+    };
+    __m256i lo_lut = _mm256_setr_epi8(
+        8, 8, 9, 8, 8, 8, 9, 9, 8, 8, 8, 8, 14, 8, 10, 8,
+        8, 8, 9, 8, 8, 8, 9, 9, 8, 8, 8, 8, 14, 8, 10, 8);
+    __m256i hi_lut = _mm256_setr_epi8(
+        8, 8, 1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        8, 8, 1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m256i mask0f = _mm256_set1_epi8(0x0f);
+    __m256i zero = _mm256_setzero_si256();
+    uint8_t *dst = p->base + p->len;
+    size_t i = 0;
+    while (i + 32 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(bytes + i));
+        __m256i lo = _mm256_shuffle_epi8(lo_lut, v);
+        __m256i hi = _mm256_shuffle_epi8(hi_lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), mask0f));
+        __m256i hit = _mm256_and_si256(lo, hi);
+        uint32_t m = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, zero));
+        _mm256_storeu_si256((__m256i *)dst, v);
+        if (m == 0) {
+            dst += 32; i += 32;
+            continue;
+        }
+        size_t k = (size_t)__builtin_ctz(m);
+        dst += k; i += k;
+        uint8_t c = bytes[i++];
+        switch (c) {
+            case '&': __builtin_memcpy(dst, "&amp;", 5); dst += 5; break;
+            case '<': __builtin_memcpy(dst, "&lt;", 4); dst += 4; break;
+            case '>': __builtin_memcpy(dst, "&gt;", 4); dst += 4; break;
+            case '"': __builtin_memcpy(dst, "&quot;", 6); dst += 6; break;
+            case '\'': __builtin_memcpy(dst, "&#39;", 5); dst += 5; break;
+            case '\\': dst[0] = '\\'; dst[1] = '\\'; dst += 2; break;
+            case '\n': dst[0] = '\\'; dst[1] = 'n'; dst += 2; break;
+            case '\r': dst[0] = '\\'; dst[1] = 'r'; dst += 2; break;
+            case '\t': dst[0] = '\\'; dst[1] = 't'; dst += 2; break;
+            case 0x08: dst[0] = '\\'; dst[1] = 'b'; dst += 2; break;
+            case 0x0c: dst[0] = '\\'; dst[1] = 'f'; dst += 2; break;
+            default:
+                __builtin_memcpy(dst, "\\u00", 4);
+                dst[4] = (uint8_t)HEX[(c >> 4) & 0xf];
+                dst[5] = (uint8_t)HEX[c & 0xf];
+                dst += 6;
+                break;
+        }
+    }
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(bytes + i));
+        __m128i lo = _mm_shuffle_epi8(_mm256_castsi256_si128(lo_lut), v);
+        __m128i hi = _mm_shuffle_epi8(_mm256_castsi256_si128(hi_lut),
+                                      _mm_and_si128(_mm_srli_epi16(v, 4), _mm256_castsi256_si128(mask0f)));
+        __m128i hit = _mm_and_si128(lo, hi);
+        uint32_t m = ((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hit, _mm_setzero_si128()))) ^ 0xffffu;
+        _mm_storeu_si128((__m128i *)dst, v);
+        if (m == 0) {
+            dst += 16; i += 16;
+            continue;
+        }
+        size_t k = (size_t)__builtin_ctz(m);
+        dst += k; i += k;
+        uint8_t c = bytes[i++];
+        switch (c) {
+            case '&': __builtin_memcpy(dst, "&amp;", 5); dst += 5; break;
+            case '<': __builtin_memcpy(dst, "&lt;", 4); dst += 4; break;
+            case '>': __builtin_memcpy(dst, "&gt;", 4); dst += 4; break;
+            case '"': __builtin_memcpy(dst, "&quot;", 6); dst += 6; break;
+            case '\'': __builtin_memcpy(dst, "&#39;", 5); dst += 5; break;
+            case '\\': dst[0] = '\\'; dst[1] = '\\'; dst += 2; break;
+            case '\n': dst[0] = '\\'; dst[1] = 'n'; dst += 2; break;
+            case '\r': dst[0] = '\\'; dst[1] = 'r'; dst += 2; break;
+            case '\t': dst[0] = '\\'; dst[1] = 't'; dst += 2; break;
+            case 0x08: dst[0] = '\\'; dst[1] = 'b'; dst += 2; break;
+            case 0x0c: dst[0] = '\\'; dst[1] = 'f'; dst += 2; break;
+            default:
+                __builtin_memcpy(dst, "\\u00", 4);
+                dst[4] = (uint8_t)HEX[(c >> 4) & 0xf];
+                dst[5] = (uint8_t)HEX[c & 0xf];
+                dst += 6;
+                break;
+        }
+    }
+    while (i < n) {
+        uint8_t c = bytes[i++];
+        if (!TBL[c]) { *dst++ = c; continue; }
+        switch (c) {
+            case '&': __builtin_memcpy(dst, "&amp;", 5); dst += 5; break;
+            case '<': __builtin_memcpy(dst, "&lt;", 4); dst += 4; break;
+            case '>': __builtin_memcpy(dst, "&gt;", 4); dst += 4; break;
+            case '"': __builtin_memcpy(dst, "&quot;", 6); dst += 6; break;
+            case '\'': __builtin_memcpy(dst, "&#39;", 5); dst += 5; break;
+            case '\\': dst[0] = '\\'; dst[1] = '\\'; dst += 2; break;
+            case '\n': dst[0] = '\\'; dst[1] = 'n'; dst += 2; break;
+            case '\r': dst[0] = '\\'; dst[1] = 'r'; dst += 2; break;
+            case '\t': dst[0] = '\\'; dst[1] = 't'; dst += 2; break;
+            case 0x08: dst[0] = '\\'; dst[1] = 'b'; dst += 2; break;
+            case 0x0c: dst[0] = '\\'; dst[1] = 'f'; dst += 2; break;
+            default:
+                __builtin_memcpy(dst, "\\u00", 4);
+                dst[4] = (uint8_t)HEX[(c >> 4) & 0xf];
+                dst[5] = (uint8_t)HEX[c & 0xf];
+                dst += 6;
+                break;
+        }
+    }
+    p->len = (size_t)(dst - p->base);
+}
+
 void html_json_escape_into(Pool *p, const uint8_t *bytes, size_t n) {
+    if (n == 0) return;
+    if (g_has_avx2) { html_json_escape_into_avx2(p, bytes, n); return; }
     static const char *HEX = "0123456789abcdef";
     size_t i = 0;
     while (i < n) {

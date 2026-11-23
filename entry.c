@@ -28,6 +28,7 @@ static void fail(const char *msg) {
 }
 
 int entry_main(long *sp) {
+    cpu_detect();
     long argc = sp[0];
     if (argc < 3) fail("usage: site <cases.json> <answers.json>\n");
     const char *in_path = (const char *)sp[2];
