@@ -64,12 +64,9 @@ int os_fstat_reg_size(int fd, size_t *sz_out) {
 
 void *os_mmap_ro(int fd, size_t len) {
     if (len == 0) return 0;
-    /* PROT_READ=1, MAP_PRIVATE|MAP_POPULATE=0x8002 */
-    long r = raw_call(9, 0, (long)len, 1, 0x8002, fd, 0);
-    if (r < 0 && r > -4096) {
-        r = raw_call(9, 0, (long)len, 1, 0x02, fd, 0);
-        if (r < 0 && r > -4096) return 0;
-    }
+    /* PROT_READ=1, MAP_PRIVATE=0x02 (demand-faulting avoids upfront MAP_POPULATE kernel scan) */
+    long r = raw_call(9, 0, (long)len, 1, 0x02, fd, 0);
+    if (r < 0 && r > -4096) return 0;
     return (void *)r;
 }
 
@@ -266,7 +263,8 @@ void pool_open(Pool *p, size_t cap) {
 }
 
 void pool_open_stream(Pool *p, size_t cap, int fd) {
-    p->base = os_map((long)cap);
+    p->base = (cap >= (1u << 21)) ? os_map_huge(cap) : os_map((long)cap);
+    if (!p->base) p->base = os_map((long)cap);
     p->len = 0;
     p->cap = cap;
     p->fd = fd;
@@ -341,10 +339,26 @@ static void sort_merge(uint8_t *a, uint8_t *tmp, size_t esz, size_t lo, size_t m
 
 static void sort_rec(uint8_t *a, uint8_t *tmp, size_t esz, size_t lo, size_t hi,
                      void *ctx, int (*cmp)(void *, const void *, const void *)) {
-    if (hi - lo < 2) return;
-    size_t mid = lo + (hi - lo) / 2;
+    size_t n = hi - lo;
+    if (n < 2) return;
+    if (n <= 16) {
+        for (size_t i = lo + 1; i < hi; i++) {
+            uint8_t *cur = a + i * esz;
+            if (cmp(ctx, a + (i - 1) * esz, cur) <= 0) continue;
+            copy_fast(tmp, cur, esz);
+            size_t j = i;
+            while (j > lo && cmp(ctx, a + (j - 1) * esz, tmp) > 0) {
+                copy_fast(a + j * esz, a + (j - 1) * esz, esz);
+                j--;
+            }
+            copy_fast(a + j * esz, tmp, esz);
+        }
+        return;
+    }
+    size_t mid = lo + n / 2;
     sort_rec(a, tmp, esz, lo, mid, ctx, cmp);
     sort_rec(a, tmp, esz, mid, hi, ctx, cmp);
+    if (cmp(ctx, a + (mid - 1) * esz, a + mid * esz) <= 0) return;
     sort_merge(a, tmp, esz, lo, mid, hi, ctx, cmp);
 }
 
@@ -357,12 +371,13 @@ void arr_sort(Arr *a, Pool *p, void *ctx, int (*cmp)(void *ctx, const void *x, c
 /* ---------------- byte string (mmap-backed) ---------------- */
 void str_grow(Str *s, size_t n) {
     if (n <= s->cap) return;
-    size_t ncap = s->cap ? s->cap * 2 : 4096;
-    while (ncap < n) ncap *= 2;
+    size_t need = n + 64; /* guarantee >=64B readable/writable slack past s->cap */
+    size_t ncap = s->cap ? (s->cap + 64) * 2 : 4096;
+    while (ncap < need) ncap *= 2;
     uint8_t *np = os_alloc(ncap);
     if (s->data && s->len) copy_bytes(np, s->data, s->len);
     s->data = np;
-    s->cap = ncap;
+    s->cap = ncap - 64;
 }
 
 void str_i64(Str *s, int64_t n) {

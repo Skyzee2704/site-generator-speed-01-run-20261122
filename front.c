@@ -7,8 +7,10 @@ static const char *META_KEYS[7] = {"title", "date", "tags", "draft", "layout", "
 
 static inline int meta_nl(Pool *p, size_t from, size_t end) {
     const uint8_t *b = p->base;
-    for (size_t i = from; i < end; i++) {
+    size_t i = from;
+    while (i < end) {
         if (b[i] == '\n') return (int)i;
+        i++;
     }
     return -1;
 }
@@ -57,9 +59,19 @@ static bool str_value(Pool *p, size_t voff, size_t vlen, Sp *out, const char **e
             *err = "a quoted string is not closed";
             return false;
         }
-        uint32_t start = pool_mark(p);
         size_t i = voff + 1;
         size_t last = voff + vlen - 1;
+        int hit = scan_two(p->base, last, i, '\\', '"');
+        if (__builtin_expect(hit < 0, 1)) {
+            /* Zero-copy fast path: no escapes and no stray quotes! */
+            *out = (Sp){(uint32_t)i, (uint32_t)(last - i)};
+            return true;
+        }
+        uint32_t start = pool_mark(p);
+        if ((size_t)hit > i) {
+            pool_put(p, p->base + i, (size_t)hit - i);
+            i = (size_t)hit;
+        }
         while (i < last) {
             uint8_t c = p->base[i];
             if (c == '\\') {
@@ -165,7 +177,7 @@ static bool tags_parse(Pool *p, size_t voff, size_t vlen, Arr *tags_out, const c
     return true;
 }
 
-static bool meta_parse_lines(Pool *p, size_t i, size_t close_start, Sp body, Meta *out, Sp *err) {
+static bool meta_parse_inner(Pool *p, size_t first_line_end, size_t close_start, Sp body, Meta *out, Sp *err) {
     out->title = SP_NONE; out->has_date = false; out->date = SP_NONE;
     arr_new(&out->tags, sizeof(Sp));
     out->draft = false; out->has_layout = false; out->layout = SP_NONE;
@@ -174,7 +186,8 @@ static bool meta_parse_lines(Pool *p, size_t i, size_t close_start, Sp body, Met
     bool seen[7] = {false, false, false, false, false, false, false};
     bool has_title = false;
     size_t line_no = 2;
-    Str msgb; str_new(&msgb);
+    size_t i = first_line_end + 1;
+    static Str msgb;
     while (i < close_start) {
         int nl = meta_nl(p, i, close_start);
         size_t le = nl >= 0 ? (size_t)nl : close_start;
@@ -311,8 +324,12 @@ static bool meta_parse_lines(Pool *p, size_t i, size_t close_start, Sp body, Met
 }
 
 bool meta_parse_hint(Pool *p, Sp text, uint32_t fm_close_off, uint32_t body_rel_off, Meta *out, Sp *err) {
-    Sp body = {text.off + body_rel_off, text.len - body_rel_off};
-    return meta_parse_lines(p, (size_t)text.off + 4, (size_t)text.off + fm_close_off, body, out, err);
+    size_t off = text.off, len = text.len, end = off + len;
+    size_t first_line_end = off + 3;
+    size_t close_start = off + fm_close_off;
+    size_t body_start = off + body_rel_off;
+    Sp body = {(uint32_t)body_start, (uint32_t)(end - body_start)};
+    return meta_parse_inner(p, first_line_end, close_start, body, out, err);
 }
 
 bool meta_parse(Pool *p, Sp text, Meta *out, Sp *err) {
@@ -343,5 +360,5 @@ bool meta_parse(Pool *p, Sp text, Meta *out, Sp *err) {
     }
     size_t body_start = close_end < end ? close_end + 1 : end;
     Sp body = {(uint32_t)body_start, (uint32_t)(end - body_start)};
-    return meta_parse_lines(p, first_line_end + 1, close_start, body, out, err);
+    return meta_parse_inner(p, first_line_end, close_start, body, out, err);
 }

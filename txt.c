@@ -69,6 +69,20 @@ int u16_cmp(const uint8_t *a, size_t an, const uint8_t *b, size_t bn) {
      * in both strings because all preceding bytes were ASCII. */
     size_t n = an < bn ? an : bn;
     size_t i = 0;
+    while (i + 8 <= n) {
+        uint64_t wa, wb;
+        __builtin_memcpy(&wa, a + i, 8);
+        __builtin_memcpy(&wb, b + i, 8);
+        if (__builtin_expect(((wa | wb) & 0x8080808080808080ULL) == 0, 1)) {
+            if (wa != wb) {
+                int k = __builtin_ctzll(wa ^ wb) >> 3;
+                return a[i + k] < b[i + k] ? -1 : 1;
+            }
+            i += 8;
+            continue;
+        }
+        break;
+    }
     for (; i < n; i++) {
         uint8_t ca = a[i], cb = b[i];
         if (ca != cb) {
@@ -183,6 +197,39 @@ static const uint8_t SLUG_ASCII[256] = {
     [0x80 ... 0xff] = 0xff
 };
 
+Sp slug_make_fast(Pool *p, Sp text, Dict *non_ascii_cache) {
+    const uint8_t *bytes = pool_at(p, text);
+    uint32_t start = pool_mark(p);
+    bool gap = false;
+    bool ascii = true;
+    uint8_t *dst0 = p->base + start;
+    uint8_t *dst = dst0;
+    for (uint32_t i = 0; i < text.len; i++) {
+        uint8_t v = SLUG_ASCII[bytes[i]];
+        if (__builtin_expect(v == 0xff, 0)) { ascii = false; break; }
+        if (v) {
+            if (gap) *dst++ = '-';
+            gap = false;
+            *dst++ = v;
+        } else {
+            gap = dst > dst0;
+        }
+    }
+    if (__builtin_expect(ascii, 1)) {
+        size_t slen = (size_t)(dst - dst0);
+        if (slen > 64) slen = 64;
+        while (slen > 0 && dst0[slen - 1] == '-') slen--;
+        if (__builtin_expect(slen == 0, 0)) {
+            p->len = start;
+            return pool_store(p, (const uint8_t *)"untitled", 8);
+        }
+        p->len = start + slen;
+        return (Sp){start, (uint32_t)slen};
+    }
+    p->len = start;
+    return slug_make(p, text, non_ascii_cache);
+}
+
 Sp slug_make(Pool *p, Sp text, Dict *cache) {
     const uint8_t *bytes = pool_at(p, text);
     Sp hit;
@@ -262,16 +309,12 @@ Sp slug_unique(Pool *p, Sp slug, Set *taken) {
     }
 }
 
-static inline unsigned popcount64_swar(uint64_t x) {
-    x -= (x >> 1) & 0x5555555555555555ULL;
-    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
-    x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
-    return (unsigned)((x * 0x0101010101010101ULL) >> 56);
-}
-
-__attribute__((target("popcnt")))
-static inline unsigned popcount64_hw(uint64_t x) {
-    return (unsigned)__builtin_popcountll(x);
+static inline unsigned popcount16(uint16_t x) {
+    x = (uint16_t)((x & 0x5555u) + ((x >> 1) & 0x5555u));
+    x = (uint16_t)((x & 0x3333u) + ((x >> 2) & 0x3333u));
+    x = (uint16_t)((x & 0x0f0fu) + ((x >> 4) & 0x0f0fu));
+    x = (uint16_t)((x & 0x00ffu) + ((x >> 8) & 0x00ffu));
+    return x;
 }
 
 __attribute__((target("avx2,popcnt")))
@@ -378,8 +421,14 @@ static size_t word_count_avx2(const uint8_t *b, size_t n) {
     return count;
 }
 
-size_t word_count(const uint8_t *b, size_t n) {
-    if (g_has_avx2 && g_has_popcnt && n >= 32) return word_count_avx2(b, n);
+static inline unsigned popcount64_sw(uint64_t x) {
+    x = x - ((x >> 1) & 0x5555555555555555ULL);
+    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+    return (unsigned)((((x + (x >> 4)) & 0x0f0f0f0f0f0f0f0fULL) * 0x0101010101010101ULL) >> 56);
+}
+
+__attribute__((target("popcnt")))
+static size_t word_count_sse2_popcnt(const uint8_t *b, size_t n) {
     size_t count = 0, i = 0;
     bool in_word = false;
     __m128i vsp = _mm_set1_epi8(' ');
@@ -393,8 +442,7 @@ size_t word_count(const uint8_t *b, size_t n) {
         __m128i v1 = _mm_loadu_si128((const __m128i *)(b + i + 16));
         __m128i v2 = _mm_loadu_si128((const __m128i *)(b + i + 32));
         __m128i v3 = _mm_loadu_si128((const __m128i *)(b + i + 48));
-        __m128i any_hi = _mm_or_si128(_mm_or_si128(v0, v1), _mm_or_si128(v2, v3));
-        if (__builtin_expect(_mm_movemask_epi8(any_hi) != 0, 0)) {
+        if (__builtin_expect(_mm_movemask_epi8(_mm_or_si128(_mm_or_si128(v0, v1), _mm_or_si128(v2, v3))) != 0, 0)) {
             __m128i sp0 = _mm_or_si128(_mm_cmpeq_epi8(v0, vc2), _mm_cmpeq_epi8(_mm_and_si128(v0, maskf0), ve0));
             __m128i sp1 = _mm_or_si128(_mm_cmpeq_epi8(v1, vc2), _mm_cmpeq_epi8(_mm_and_si128(v1, maskf0), ve0));
             __m128i sp2 = _mm_or_si128(_mm_cmpeq_epi8(v2, vc2), _mm_cmpeq_epi8(_mm_and_si128(v2, maskf0), ve0));
@@ -420,23 +468,92 @@ size_t word_count(const uint8_t *b, size_t n) {
                 continue;
             }
         }
-        __m128i w0 = _mm_or_si128(_mm_cmpeq_epi8(v0, vsp), _mm_and_si128(_mm_cmpgt_epi8(v0, v8), _mm_cmpgt_epi8(v14, v0)));
-        __m128i w1 = _mm_or_si128(_mm_cmpeq_epi8(v1, vsp), _mm_and_si128(_mm_cmpgt_epi8(v1, v8), _mm_cmpgt_epi8(v14, v1)));
-        __m128i w2 = _mm_or_si128(_mm_cmpeq_epi8(v2, vsp), _mm_and_si128(_mm_cmpgt_epi8(v2, v8), _mm_cmpgt_epi8(v14, v2)));
-        __m128i w3 = _mm_or_si128(_mm_cmpeq_epi8(v3, vsp), _mm_and_si128(_mm_cmpgt_epi8(v3, v8), _mm_cmpgt_epi8(v14, v3)));
-        uint64_t ws = (uint64_t)(uint16_t)_mm_movemask_epi8(w0)
-            | ((uint64_t)(uint16_t)_mm_movemask_epi8(w1) << 16)
-            | ((uint64_t)(uint16_t)_mm_movemask_epi8(w2) << 32)
-            | ((uint64_t)(uint16_t)_mm_movemask_epi8(w3) << 48);
-        uint64_t starts = (~ws) & ((ws << 1) | (in_word ? 0ULL : 1ULL));
-        count += g_has_popcnt ? popcount64_hw(starts) : popcount64_swar(starts);
+        uint64_t m0 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v0, vsp), _mm_and_si128(_mm_cmpgt_epi8(v0, v8), _mm_cmpgt_epi8(v14, v0))));
+        uint64_t m1 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v1, vsp), _mm_and_si128(_mm_cmpgt_epi8(v1, v8), _mm_cmpgt_epi8(v14, v1))));
+        uint64_t m2 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v2, vsp), _mm_and_si128(_mm_cmpgt_epi8(v2, v8), _mm_cmpgt_epi8(v14, v2))));
+        uint64_t m3 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v3, vsp), _mm_and_si128(_mm_cmpgt_epi8(v3, v8), _mm_cmpgt_epi8(v14, v3))));
+        uint64_t ws = m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
+        uint64_t prev = (ws << 1) | (in_word ? 0ULL : 1ULL);
+        count += (size_t)__builtin_popcountll((~ws) & prev);
+        in_word = (ws >> 63) == 0;
+        i += 64;
+    }
+    while (i < n) {
+        uint8_t c0 = b[i];
+        if (c0 < 0x80) {
+            if (ws_byte(c0)) in_word = false;
+            else if (!in_word) { in_word = true; count++; }
+            i++;
+        } else if ((c0 & 0xc0) == 0x80) {
+            if (!in_word) { in_word = true; count++; }
+            i++;
+        } else {
+            uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
+            if (u_is_space(c)) in_word = false;
+            else if (!in_word) { in_word = true; count++; }
+            i += m;
+        }
+    }
+    return count;
+}
+
+size_t word_count(const uint8_t *b, size_t n) {
+    if (g_has_avx2 && g_has_popcnt && n >= 32) return word_count_avx2(b, n);
+    if (g_has_popcnt && n >= 64) return word_count_sse2_popcnt(b, n);
+    size_t count = 0, i = 0;
+    bool in_word = false;
+    __m128i vsp = _mm_set1_epi8(' ');
+    __m128i v8 = _mm_set1_epi8(8);
+    __m128i v14 = _mm_set1_epi8(14);
+    __m128i maskf0 = _mm_set1_epi8((char)0xf0);
+    __m128i ve0 = _mm_set1_epi8((char)0xe0);
+    __m128i vc2 = _mm_set1_epi8((char)0xc2);
+    while (i + 64 <= n) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(b + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(b + i + 16));
+        __m128i v2 = _mm_loadu_si128((const __m128i *)(b + i + 32));
+        __m128i v3 = _mm_loadu_si128((const __m128i *)(b + i + 48));
+        if (__builtin_expect(_mm_movemask_epi8(_mm_or_si128(_mm_or_si128(v0, v1), _mm_or_si128(v2, v3))) != 0, 0)) {
+            __m128i sp0 = _mm_or_si128(_mm_cmpeq_epi8(v0, vc2), _mm_cmpeq_epi8(_mm_and_si128(v0, maskf0), ve0));
+            __m128i sp1 = _mm_or_si128(_mm_cmpeq_epi8(v1, vc2), _mm_cmpeq_epi8(_mm_and_si128(v1, maskf0), ve0));
+            __m128i sp2 = _mm_or_si128(_mm_cmpeq_epi8(v2, vc2), _mm_cmpeq_epi8(_mm_and_si128(v2, maskf0), ve0));
+            __m128i sp3 = _mm_or_si128(_mm_cmpeq_epi8(v3, vc2), _mm_cmpeq_epi8(_mm_and_si128(v3, maskf0), ve0));
+            if (_mm_movemask_epi8(_mm_or_si128(_mm_or_si128(sp0, sp1), _mm_or_si128(sp2, sp3))) != 0) {
+                size_t end = i + 64;
+                while (i < end) {
+                    uint8_t c0 = b[i];
+                    if (c0 < 0x80) {
+                        if (ws_byte(c0)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else if ((c0 & 0xc0) == 0x80) {
+                        if (!in_word) { in_word = true; count++; }
+                        i++;
+                    } else {
+                        uint32_t c; size_t m = (size_t)u8_decode(b, n, i, &c);
+                        if (u_is_space(c)) in_word = false;
+                        else if (!in_word) { in_word = true; count++; }
+                        i += m;
+                    }
+                }
+                continue;
+            }
+        }
+        uint64_t m0 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v0, vsp), _mm_and_si128(_mm_cmpgt_epi8(v0, v8), _mm_cmpgt_epi8(v14, v0))));
+        uint64_t m1 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v1, vsp), _mm_and_si128(_mm_cmpgt_epi8(v1, v8), _mm_cmpgt_epi8(v14, v1))));
+        uint64_t m2 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v2, vsp), _mm_and_si128(_mm_cmpgt_epi8(v2, v8), _mm_cmpgt_epi8(v14, v2))));
+        uint64_t m3 = (uint16_t)_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v3, vsp), _mm_and_si128(_mm_cmpgt_epi8(v3, v8), _mm_cmpgt_epi8(v14, v3))));
+        uint64_t ws = m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
+        uint64_t prev = (ws << 1) | (in_word ? 0ULL : 1ULL);
+        count += (size_t)popcount64_sw((~ws) & prev);
         in_word = (ws >> 63) == 0;
         i += 64;
     }
     while (i + 16 <= n) {
         __m128i v = _mm_loadu_si128((const __m128i *)(b + i));
         if (__builtin_expect(_mm_movemask_epi8(v) != 0, 0)) {
-            __m128i sp = _mm_or_si128(_mm_cmpeq_epi8(v, vc2), _mm_cmpeq_epi8(_mm_and_si128(v, maskf0), ve0));
+            __m128i sp = _mm_or_si128(_mm_cmpeq_epi8(v, vc2),
+                                      _mm_cmpeq_epi8(_mm_and_si128(v, maskf0), ve0));
             if (_mm_movemask_epi8(sp) != 0) {
                 size_t end = i + 16;
                 while (i < end) {
@@ -458,10 +575,12 @@ size_t word_count(const uint8_t *b, size_t n) {
                 continue;
             }
         }
-        __m128i w = _mm_or_si128(_mm_cmpeq_epi8(v, vsp), _mm_and_si128(_mm_cmpgt_epi8(v, v8), _mm_cmpgt_epi8(v14, v)));
-        uint16_t ws = (uint16_t)_mm_movemask_epi8(w);
-        uint64_t starts = (uint16_t)((uint16_t)(~ws) & (uint16_t)((ws << 1) | (in_word ? 0u : 1u)));
-        count += g_has_popcnt ? popcount64_hw(starts) : popcount64_swar(starts);
+        __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, vsp),
+            _mm_and_si128(_mm_cmpgt_epi8(v, v8), _mm_cmpgt_epi8(v14, v)));
+        uint16_t ws = (uint16_t)_mm_movemask_epi8(m);
+        uint16_t nonws = (uint16_t)~ws;
+        uint16_t prev = (uint16_t)((ws << 1) | (in_word ? 0 : 1));
+        count += (size_t)popcount16((uint16_t)(nonws & prev));
         in_word = (ws & 0x8000u) == 0;
         i += 16;
     }
@@ -622,23 +741,157 @@ static void html_json_escape_into_avx2(Pool *p, const uint8_t *bytes, size_t n) 
     p->len = (size_t)(dst - p->base);
 }
 
+__attribute__((target("ssse3")))
+static void html_json_escape_into_ssse3(Pool *p, const uint8_t *bytes, size_t n) {
+    static const char HEX[] = "0123456789abcdef";
+    static const uint8_t TBL[256] = {
+        [0 ... 0x1f] = 1,
+        ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1, ['\\'] = 1
+    };
+    __m128i lo_lut = _mm_setr_epi8(8, 8, 9, 8, 8, 8, 9, 9, 8, 8, 8, 8, 14, 8, 10, 8);
+    __m128i hi_lut = _mm_setr_epi8(8, 8, 1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m128i mask0f = _mm_set1_epi8(0x0f);
+    __m128i zero = _mm_setzero_si128();
+    uint8_t *dst = p->base + p->len;
+    size_t i = 0;
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(bytes + i));
+        __m128i lo = _mm_shuffle_epi8(lo_lut, v);
+        __m128i hi = _mm_shuffle_epi8(hi_lut, _mm_and_si128(_mm_srli_epi16(v, 4), mask0f));
+        uint32_t m = ((uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_and_si128(lo, hi), zero))) ^ 0xffffu;
+        _mm_storeu_si128((__m128i *)dst, v);
+        if (m == 0) { dst += 16; i += 16; continue; }
+        size_t k = (size_t)__builtin_ctz(m);
+        dst += k; i += k;
+        uint8_t c = bytes[i++];
+        switch (c) {
+            case '&': __builtin_memcpy(dst, "&amp;", 5); dst += 5; break;
+            case '<': __builtin_memcpy(dst, "&lt;", 4); dst += 4; break;
+            case '>': __builtin_memcpy(dst, "&gt;", 4); dst += 4; break;
+            case '"': __builtin_memcpy(dst, "&quot;", 6); dst += 6; break;
+            case '\'': __builtin_memcpy(dst, "&#39;", 5); dst += 5; break;
+            case '\\': dst[0] = '\\'; dst[1] = '\\'; dst += 2; break;
+            case '\n': dst[0] = '\\'; dst[1] = 'n'; dst += 2; break;
+            case '\r': dst[0] = '\\'; dst[1] = 'r'; dst += 2; break;
+            case '\t': dst[0] = '\\'; dst[1] = 't'; dst += 2; break;
+            case 0x08: dst[0] = '\\'; dst[1] = 'b'; dst += 2; break;
+            case 0x0c: dst[0] = '\\'; dst[1] = 'f'; dst += 2; break;
+            default:
+                __builtin_memcpy(dst, "\\u00", 4);
+                dst[4] = (uint8_t)HEX[(c >> 4) & 0xf];
+                dst[5] = (uint8_t)HEX[c & 0xf];
+                dst += 6;
+                break;
+        }
+    }
+    while (i < n) {
+        uint8_t c = bytes[i++];
+        if (!TBL[c]) { *dst++ = c; continue; }
+        switch (c) {
+            case '&': __builtin_memcpy(dst, "&amp;", 5); dst += 5; break;
+            case '<': __builtin_memcpy(dst, "&lt;", 4); dst += 4; break;
+            case '>': __builtin_memcpy(dst, "&gt;", 4); dst += 4; break;
+            case '"': __builtin_memcpy(dst, "&quot;", 6); dst += 6; break;
+            case '\'': __builtin_memcpy(dst, "&#39;", 5); dst += 5; break;
+            case '\\': dst[0] = '\\'; dst[1] = '\\'; dst += 2; break;
+            case '\n': dst[0] = '\\'; dst[1] = 'n'; dst += 2; break;
+            case '\r': dst[0] = '\\'; dst[1] = 'r'; dst += 2; break;
+            case '\t': dst[0] = '\\'; dst[1] = 't'; dst += 2; break;
+            case 0x08: dst[0] = '\\'; dst[1] = 'b'; dst += 2; break;
+            case 0x0c: dst[0] = '\\'; dst[1] = 'f'; dst += 2; break;
+            default:
+                __builtin_memcpy(dst, "\\u00", 4);
+                dst[4] = (uint8_t)HEX[(c >> 4) & 0xf];
+                dst[5] = (uint8_t)HEX[c & 0xf];
+                dst += 6;
+                break;
+        }
+    }
+    p->len = (size_t)(dst - p->base);
+}
+
+static void html_json_escape_into_sse2(Pool *p, const uint8_t *bytes, size_t n) {
+    static const char HEX[] = "0123456789abcdef";
+    static const uint8_t TBL[256] = {
+        [0 ... 0x1f] = 1,
+        ['&'] = 1, ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1, ['\\'] = 1
+    };
+    __m128i c1f = _mm_set1_epi8(0x1f);
+    __m128i mfe = _mm_set1_epi8((char)0xfe);
+    __m128i v26 = _mm_set1_epi8(0x26);
+    __m128i mfd = _mm_set1_epi8((char)0xfd);
+    __m128i v3c = _mm_set1_epi8(0x3c);
+    __m128i vq = _mm_set1_epi8('"');
+    __m128i vbs = _mm_set1_epi8('\\');
+    uint8_t *dst = p->base + p->len;
+    size_t i = 0;
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(bytes + i));
+        __m128i h1 = _mm_or_si128(_mm_cmpeq_epi8(_mm_min_epu8(v, c1f), v),
+                                  _mm_cmpeq_epi8(_mm_and_si128(v, mfe), v26));
+        __m128i h2 = _mm_or_si128(_mm_cmpeq_epi8(_mm_and_si128(v, mfd), v3c),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, vq), _mm_cmpeq_epi8(v, vbs)));
+        uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_or_si128(h1, h2));
+        _mm_storeu_si128((__m128i *)dst, v);
+        if (m == 0) { dst += 16; i += 16; continue; }
+        size_t k = (size_t)__builtin_ctz(m);
+        dst += k; i += k;
+        uint8_t c = bytes[i++];
+        switch (c) {
+            case '&': __builtin_memcpy(dst, "&amp;", 5); dst += 5; break;
+            case '<': __builtin_memcpy(dst, "&lt;", 4); dst += 4; break;
+            case '>': __builtin_memcpy(dst, "&gt;", 4); dst += 4; break;
+            case '"': __builtin_memcpy(dst, "&quot;", 6); dst += 6; break;
+            case '\'': __builtin_memcpy(dst, "&#39;", 5); dst += 5; break;
+            case '\\': dst[0] = '\\'; dst[1] = '\\'; dst += 2; break;
+            case '\n': dst[0] = '\\'; dst[1] = 'n'; dst += 2; break;
+            case '\r': dst[0] = '\\'; dst[1] = 'r'; dst += 2; break;
+            case '\t': dst[0] = '\\'; dst[1] = 't'; dst += 2; break;
+            case 0x08: dst[0] = '\\'; dst[1] = 'b'; dst += 2; break;
+            case 0x0c: dst[0] = '\\'; dst[1] = 'f'; dst += 2; break;
+            default:
+                __builtin_memcpy(dst, "\\u00", 4);
+                dst[4] = (uint8_t)HEX[(c >> 4) & 0xf];
+                dst[5] = (uint8_t)HEX[c & 0xf];
+                dst += 6;
+                break;
+        }
+    }
+    while (i < n) {
+        uint8_t c = bytes[i++];
+        if (!TBL[c]) { *dst++ = c; continue; }
+        switch (c) {
+            case '&': __builtin_memcpy(dst, "&amp;", 5); dst += 5; break;
+            case '<': __builtin_memcpy(dst, "&lt;", 4); dst += 4; break;
+            case '>': __builtin_memcpy(dst, "&gt;", 4); dst += 4; break;
+            case '"': __builtin_memcpy(dst, "&quot;", 6); dst += 6; break;
+            case '\'': __builtin_memcpy(dst, "&#39;", 5); dst += 5; break;
+            case '\\': dst[0] = '\\'; dst[1] = '\\'; dst += 2; break;
+            case '\n': dst[0] = '\\'; dst[1] = 'n'; dst += 2; break;
+            case '\r': dst[0] = '\\'; dst[1] = 'r'; dst += 2; break;
+            case '\t': dst[0] = '\\'; dst[1] = 't'; dst += 2; break;
+            case 0x08: dst[0] = '\\'; dst[1] = 'b'; dst += 2; break;
+            case 0x0c: dst[0] = '\\'; dst[1] = 'f'; dst += 2; break;
+            default:
+                __builtin_memcpy(dst, "\\u00", 4);
+                dst[4] = (uint8_t)HEX[(c >> 4) & 0xf];
+                dst[5] = (uint8_t)HEX[c & 0xf];
+                dst += 6;
+                break;
+        }
+    }
+    p->len = (size_t)(dst - p->base);
+}
+
 void html_json_escape_into(Pool *p, const uint8_t *bytes, size_t n) {
     if (n == 0) return;
-    if (g_has_avx2) {
-        if (__builtin_expect(p->fd >= 0 && p->len + n * 6 + 64 > p->cap, 0)) {
-            out_flush(p);
-            size_t chunk = (p->cap - 64) / 6;
-            size_t off = 0;
-            while (off < n) {
-                size_t step = n - off;
-                if (step > chunk) step = chunk;
-                html_json_escape_into_avx2(p, bytes + off, step);
-                off += step;
-                if (off < n) out_flush(p);
-            }
-            return;
-        }
-        html_json_escape_into_avx2(p, bytes, n);
+    if (__builtin_expect(p->fd >= 0 && p->len + n * 6 + 64 > p->cap, 0)) {
+        out_flush(p);
+    }
+    if (__builtin_expect(p->len + n * 6 + 64 <= p->cap, 1)) {
+        if (g_has_avx2) { html_json_escape_into_avx2(p, bytes, n); return; }
+        if (g_has_ssse3) { html_json_escape_into_ssse3(p, bytes, n); return; }
+        html_json_escape_into_sse2(p, bytes, n);
         return;
     }
     static const char *HEX = "0123456789abcdef";

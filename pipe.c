@@ -52,12 +52,6 @@ static Sp crlf_norm(Pool *p, Sp content) {
     return pool_span(p, start);
 }
 
-static int cmp_rawfile(void *ctx, const void *x, const void *y) {
-    Pool *p = ctx;
-    const RawFile *a = x, *b = y;
-    return u16_cmp(pool_at(p, a->path), a->path.len, pool_at(p, b->path), b->path.len);
-}
-
 static int cmp_pair(void *ctx, const void *x, const void *y) {
     Pool *p = ctx;
     const SpPair *a = x, *b = y;
@@ -76,9 +70,27 @@ static int cmp_posts(void *ctx, const void *x, const void *y) {
     uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
     Page *pa = arr_at(c->pages, a);
     Page *pb = arr_at(c->pages, b);
-    int d = u16_cmp(pool_at(c->pool, pb->date), pb->date.len, pool_at(c->pool, pa->date), pa->date.len);
-    if (d) return d;
-    return u16_cmp(pool_at(c->pool, pa->slug), pa->slug.len, pool_at(c->pool, pb->slug), pb->slug.len);
+    const uint8_t *base = c->pool->base;
+    if (__builtin_expect(pa->date.len == 10 && pb->date.len == 10, 1)) {
+        uint64_t da0, db0;
+        __builtin_memcpy(&da0, base + pa->date.off, 8);
+        __builtin_memcpy(&db0, base + pb->date.off, 8);
+        if (da0 != db0) {
+            uint64_t xa = __builtin_bswap64(da0), xb = __builtin_bswap64(db0);
+            return xb > xa ? 1 : -1;
+        }
+        uint16_t da1, db1;
+        __builtin_memcpy(&da1, base + pa->date.off + 8, 2);
+        __builtin_memcpy(&db1, base + pb->date.off + 8, 2);
+        if (da1 != db1) {
+            uint16_t xa = __builtin_bswap16(da1), xb = __builtin_bswap16(db1);
+            return xb > xa ? 1 : -1;
+        }
+    } else {
+        int d = u16_cmp(base + pb->date.off, pb->date.len, base + pa->date.off, pa->date.len);
+        if (d) return d;
+    }
+    return u16_cmp(base + pa->slug.off, pa->slug.len, base + pb->slug.off, pb->slug.len);
 }
 
 static int cmp_tags(void *ctx, const void *x, const void *y) {
@@ -125,7 +137,7 @@ static size_t page_tags(Pool *p, Arr *names, Dict *cache, NameSlug *out, size_t 
         Sp slug = slug_make(p, *nm, cache);
         bool dup = false;
         for (size_t k = 0; k < nseen; k++) {
-            if (seen[k].len == slug.len && cmp_bytes(pool_at(p, seen[k]), pool_at(p, slug), slug.len) == 0) { dup = true; break; }
+            if (seen[k].len == slug.len && eq_bytes(pool_at(p, seen[k]), pool_at(p, slug), slug.len)) { dup = true; break; }
         }
         if (dup) continue;
         if (nseen < 64) seen[nseen++] = slug;
@@ -140,44 +152,9 @@ static inline bool span_is_clean(Pool *p, Sp s) {
     return s.len == 0 || scan_html_json_esc(pool_at(p, s), s.len, 0) < 0;
 }
 
-static inline void maybe_flush(Pool *out) {
-    if (out->fd >= 0 && out->len >= 96 * 1024) out_flush(out);
-}
-
-static void setup_link_env(Pool *p, LinkCtx *env, Page *pages_ptr, size_t npages,
-                           RawFile *statics_ptr, size_t nstatics,
-                           Dict *page_map, Set *static_set, Sp base,
-                           Page *pd, Arr *broken,
-                           Str *path_buf, Str *item_buf, Str *item_scratch) {
-    env->pages = pages_ptr;
-    env->npages = npages;
-    env->statics = statics_ptr;
-    env->nstatics = nstatics;
-    env->page_map = page_map;
-    env->static_set = static_set;
-    env->base = base;
-    env->dir = path_dir(p, pd->path);
-    env->dir_np = 0;
-    if (env->dir.len > 0) {
-        const uint8_t *db = pool_at(p, env->dir);
-        size_t ds = 0;
-        for (size_t di = 0; di <= env->dir.len; di++) {
-            if (di == env->dir.len || db[di] == '/') {
-                if (env->dir_np < 64) { env->dir_parts[env->dir_np] = db + ds; env->dir_plens[env->dir_np] = di - ds; env->dir_np++; }
-                ds = di + 1;
-            }
-        }
-    }
-    env->src_path = pd->path;
-    env->broken = broken;
-    env->path_buf = path_buf;
-    env->item_buf = item_buf;
-    env->item_scratch = item_scratch;
-}
-
-bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
+bool case_build(Pool *p, CaseInput *c, Pool *out) {
     /* readSources: sort files by path (code-unit order). */
-    arr_sort(&c->files, p, p, cmp_rawfile);
+    arr_sort(&c->files, p, p, cmp_pair);
     arr_sort(&c->templates, p, p, cmp_pair);
     Sp base = base_strip(p, c->site.base_url);
     bool site_title_clean = span_is_clean(p, c->site.title);
@@ -207,38 +184,35 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
     /* frontMatter + permalinks (per source, in sorted path order). */
     Arr pages; arr_new(&pages, sizeof(Page));
     Arr fm_tags; arr_new(&fm_tags, sizeof(Arr)); /* Arr<Sp> per page */
-    Arr statics; arr_new(&statics, sizeof(RawFile));
+    Arr statics; arr_new(&statics, sizeof(SpPair));
     Set taken_root; set_new(&taken_root);
     for (int r = 0; r < 3; r++) {
         Sp rs = pool_store(p, RESERVED_DIRS[r], RESERVED_LEN[r]);
         set_add(&taken_root, p, rs);
     }
     Set taken_posts; set_new(&taken_posts);
+    if (c->files.len > 16) set_reserve(&taken_posts, p, c->files.len);
     Arr taken_sets; arr_new(&taken_sets, sizeof(DirTaken));
     Dict slug_cache; dict_new(&slug_cache);
-    Sp lit_posts_dir = pool_store(p, (const uint8_t *)"posts", 5);
-    Sp lit_post = pool_store(p, (const uint8_t *)"post", 4);
-    Sp lit_page = pool_store(p, (const uint8_t *)"page", 4);
+
+    Sp sp_post_lit = pool_store(p, (const uint8_t *)"post", 4);
+    Sp sp_page_lit = pool_store(p, (const uint8_t *)"page", 4);
+    Sp sp_posts_dir = pool_store(p, (const uint8_t *)"posts", 5);
     int32_t post_tpl_idx = tpl_find_idx(&templates, p, (const uint8_t *)"post", 4);
     int32_t page_tpl_idx = tpl_find_idx(&templates, p, (const uint8_t *)"page", 4);
-    (void)in_base;
 
     for (size_t fi = 0; fi < c->files.len; fi++) {
-        RawFile *fp = arr_at(&c->files, fi);
-        Sp path = fp->path;
+        SpPair *fp = arr_at(&c->files, fi);
+        Sp path = fp->a, content = fp->b;
         if (!path_is_md(p, path)) {
-            RawFile *st = arr_slot(&statics, p);
-            *st = *fp;
+            SpPair *st = arr_slot(&statics, p);
+            st->a = path; st->b = content;
             continue;
         }
-        Sp text = fp->content;
-        if (!(fp->flags & RF_CRLF_NORM)) {
-            if (fp->flags & RF_HAS_CR) text = crlf_norm(p, text);
-            else if (!(fp->flags & RF_NO_ESC)) text = crlf_norm(p, text);
-        }
+        Sp text = (!(fp->flags & FF_CRLF_OK) && (fp->flags & FF_HAS_CR)) ? crlf_norm(p, content) : content;
         Meta fm;
         Sp fm_err;
-        bool fm_ok = (fp->flags & RF_HAS_FM)
+        bool fm_ok = (fp->flags & FF_HAS_FM)
             ? meta_parse_hint(p, text, fp->fm_close_off, fp->body_rel_off, &fm, &fm_err)
             : meta_parse(p, text, &fm, &fm_err);
         if (!fm_ok) {
@@ -253,13 +227,13 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
             continue;
         }
         const uint8_t *pb = pool_at(p, path);
-        bool is_post = path.len >= 6 && cmp_bytes(pb, "posts/", 6) == 0;
+        bool is_post = path.len >= 6 && eq_bytes(pb, "posts/", 6);
         /* Reserved own directory (tags/ or page/). */
         const uint8_t *own = 0; size_t own_len = 0;
         static const uint8_t d_tags[4] = {'t', 'a', 'g', 's'};
         static const uint8_t d_page[4] = {'p', 'a', 'g', 'e'};
-        if (path.len > 5 && cmp_bytes(pb, d_tags, 4) == 0 && pb[4] == '/') { own = d_tags; own_len = 4; }
-        else if (path.len > 5 && cmp_bytes(pb, d_page, 4) == 0 && pb[4] == '/') { own = d_page; own_len = 4; }
+        if (path.len > 5 && eq_bytes(pb, d_tags, 4) && pb[4] == '/') { own = d_tags; own_len = 4; }
+        else if (path.len > 5 && eq_bytes(pb, d_page, 4) && pb[4] == '/') { own = d_page; own_len = 4; }
         if (own) {
             uint32_t st = pool_mark(p);
             pool_put(p, (const uint8_t *)"refused ", 8);
@@ -282,15 +256,10 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
             *line = span_st;
             continue;
         }
-        Sp layout;
-        int32_t layout_idx;
-        if (fm.has_layout) {
-            layout = fm.layout;
-            layout_idx = tpl_find_idx(&templates, p, pool_at(p, layout), layout.len);
-        } else {
-            layout = is_post ? lit_post : lit_page;
-            layout_idx = is_post ? post_tpl_idx : page_tpl_idx;
-        }
+        Sp layout = fm.has_layout ? fm.layout : (is_post ? sp_post_lit : sp_page_lit);
+        int32_t layout_idx = fm.has_layout
+            ? tpl_find_idx(&templates, p, pool_at(p, layout), layout.len)
+            : (is_post ? post_tpl_idx : page_tpl_idx);
         if (layout_idx < 0) {
             uint32_t st = pool_mark(p);
             pool_put(p, (const uint8_t *)"refused ", 8);
@@ -313,15 +282,13 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
             continue;
         }
         /* Permalinks: the slug, unique in its directory. */
-        Sp dir = is_post ? lit_posts_dir : path_dir(p, path);
-        Sp slug_base = fm.has_slug ? fm.slug : slug_make(p, fm.title, &slug_cache);
+        Sp dir = is_post ? sp_posts_dir : path_dir(p, path);
+        Sp slug_base = fm.has_slug ? fm.slug : slug_make_fast(p, fm.title, &slug_cache);
         Sp slug;
         if (is_post) {
             slug = slug_unique(p, slug_base, &taken_posts);
         } else if (dir.len == 0) {
             slug = slug_unique(p, slug_base, &taken_root);
-        } else if (dir.len == 5 && eq_bytes(pool_at(p, dir), "posts", 5)) {
-            slug = slug_unique(p, slug_base, &taken_posts);
         } else {
             int idx = -1;
             for (size_t k = 0; k < taken_sets.len; k++) {
@@ -364,64 +331,105 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
         pd->summary = fm.has_summary ? fm.summary : SP_NONE;
         pd->slug = slug; pd->out_dir = out_dir; pd->url = url;
         pd->html = SP_NONE; pd->excerpt = SP_NONE;
-        if (fp->flags & RF_HAS_WC) {
+        if (fp->flags & FF_HAS_WC) {
             int64_t rm = (int64_t)(((size_t)fp->word_cnt + 199) / 200);
             pd->reading_minutes = rm < 1 ? 1 : rm;
         } else {
-            size_t w = word_count(pool_at(p, fm.body), fm.body.len);
-            int64_t rm = (int64_t)((w + 199) / 200);
-            pd->reading_minutes = rm < 1 ? 1 : rm;
+            pd->reading_minutes = -1;
         }
         pd->toc = 0; pd->tags = 0; pd->newer = -1; pd->older = -1;
         pd->is_post = is_post;
+        bool url_clean = is_post ? site_base_clean : (site_base_clean && span_is_clean(p, dir));
         pd->clean_mask = (uint8_t)((span_is_clean(p, pd->title) ? 1 : 0)
-            | (span_is_clean(p, pd->url) ? 2 : 0)
+            | (url_clean ? 2 : 0)
             | (span_is_clean(p, pd->summary) ? 4 : 0));
         pd->layout_tpl = layout_idx;
-        pd->layout = layout;
-        pd->body = fm.body;
+        pd->layout = layout; pd->body = fm.body;
         Arr *ft = arr_slot(&fm_tags, p);
         *ft = fm.tags;
     }
 
-    /* Check if lazy per-page Markdown rendering is sound. */
+    /* Decide whether we can render Markdown lazily (L1-hot per page) during the
+     * page layout pass: legal whenever no page's layout template reads F_EXCERPT
+     * on a non-RF_PAGE (e.g. O_CARD via recent). */
     bool lazy_md = true;
     for (size_t pi = 0; pi < pages.len; pi++) {
         Page *pd = arr_at(&pages, pi);
-        Tpl *tpl = arr_at(&templates, (size_t)pd->layout_tpl);
-        if (tpl->uses_card_md) { lazy_md = false; break; }
+        if (pd->layout_tpl >= 0) {
+            Tpl *lt = arr_at(&templates, (size_t)pd->layout_tpl);
+            if (lt->uses_card_excerpt) { lazy_md = false; break; }
+        }
     }
 
-    /* markdown lookup tables (needed for both eager and lazy md_build). */
+    /* markdown lookup maps & scratch buffers. */
     Arr broken; arr_new(&broken, sizeof(Sp));
     Arr toc_store; arr_new(&toc_store, sizeof(Toc));
     Arr toc_arrays; arr_new(&toc_arrays, sizeof(Range));
     Dict md_slug_cache; dict_new(&md_slug_cache);
     Dict page_map; dict_new(&page_map);
+    if (pages.len > 16) dict_reserve(&page_map, p, pages.len);
     for (size_t pi = 0; pi < pages.len; pi++) {
         Page *pd = arr_at(&pages, pi);
         dict_put(&page_map, p, pd->path, (Sp){(uint32_t)pi, 0});
     }
     Set static_set; set_new(&static_set);
     for (size_t si = 0; si < statics.len; si++) {
-        RawFile *st = arr_at(&statics, si);
-        set_add(&static_set, p, st->path);
+        SpPair *st = arr_at(&statics, si);
+        set_add(&static_set, p, st->a);
     }
     static Str scratch, tmp, text_tmp, path_buf, item_buf, item_scratch;
     str_clear(&scratch); str_clear(&tmp); str_clear(&text_tmp);
     str_clear(&path_buf); str_clear(&item_buf); str_clear(&item_scratch);
+
+    /* Ensure reading_minutes is known for every page before layouts (used by card/post). */
+    for (size_t pi = 0; pi < pages.len; pi++) {
+        Page *pd = arr_at(&pages, pi);
+        if (pd->reading_minutes < 0) {
+            size_t w = word_count(pool_at(p, pd->body), pd->body.len);
+            int64_t rm = (int64_t)((w + 199) / 200);
+            pd->reading_minutes = rm < 1 ? 1 : rm;
+        }
+    }
+
     if (!lazy_md) {
-        Page *pages_ptr = pages.len ? arr_at(&pages, 0) : 0;
-        RawFile *statics_ptr = statics.len ? arr_at(&statics, 0) : 0;
         for (size_t pi = 0; pi < pages.len; pi++) {
             Page *pd = arr_at(&pages, pi);
             LinkCtx env;
-            setup_link_env(p, &env, pages_ptr, pages.len, statics_ptr, statics.len,
-                           &page_map, &static_set, base, pd, &broken,
-                           &path_buf, &item_buf, &item_scratch);
+            env.pages = arr_at(&pages, 0);
+            env.npages = pages.len;
+            env.statics = statics.len ? arr_at(&statics, 0) : 0;
+            env.nstatics = statics.len;
+            env.page_map = &page_map;
+            env.static_set = &static_set;
+            env.base = base;
+            env.base_clean = site_base_clean;
+            env.dir = path_dir(p, pd->path);
+            env.dir_clean = span_is_clean(p, env.dir);
+            env.dir_np = 0;
+            env.dir_prefix_len[0] = 0;
+            if (env.dir.len > 0) {
+                const uint8_t *db = pool_at(p, env.dir);
+                size_t ds = 0;
+                for (size_t di = 0; di <= env.dir.len; di++) {
+                    if (di == env.dir.len || db[di] == '/') {
+                        if (env.dir_np < 64) {
+                            env.dir_parts[env.dir_np] = db + ds;
+                            env.dir_plens[env.dir_np] = di - ds;
+                            env.dir_np++;
+                            env.dir_prefix_len[env.dir_np] = di;
+                        }
+                        ds = di + 1;
+                    }
+                }
+            }
+            env.src_path = pd->path;
+            env.broken = &broken;
+            env.path_buf = &path_buf;
+            env.item_buf = &item_buf;
+            env.item_scratch = &item_scratch;
             Sp html, excerpt;
             uint32_t toc_start = (uint32_t)toc_store.len;
-            md_build_buf(p, pool_at(p, pd->body), pd->body.len, &env, &md_slug_cache, &scratch, &tmp, &text_tmp, &html, &toc_store, &excerpt, md_pre_json, true);
+            md_build(p, pd->body, &env, &md_slug_cache, &scratch, &tmp, &text_tmp, &html, &toc_store, &excerpt, md_pre_json, true);
             Range *ra = arr_slot(&toc_arrays, p);
             ra->start = toc_start; ra->len = (uint32_t)toc_store.len - toc_start;
             pd->html = html;
@@ -468,10 +476,10 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
         uint32_t start = (uint32_t)tagref_store.len;
         for (size_t j = 0; j < nown; j++) {
             uint32_t ti = 0;
-            Sp hit;
-            if (dict_get(&tag_by_slug, p, pool_at(p, own[j].slug), own[j].slug.len, &hit)) {
-                ti = hit.off;
-            } else {
+            Sp hit_ti;
+            bool found = dict_get(&tag_by_slug, p, pool_at(p, own[j].slug), own[j].slug.len, &hit_ti);
+            if (found) ti = hit_ti.off;
+            if (!found) {
                 uint32_t st = pool_mark(p);
                 pool_copy(p, base);
                 pool_put(p, (const uint8_t *)"/tags/", 6);
@@ -505,9 +513,9 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
         uint32_t start = (uint32_t)tagref_store.len;
         for (size_t j = 0; j < nown; j++) {
             Tag *t = 0;
-            Sp hit;
-            if (dict_get(&tag_by_slug, p, pool_at(p, own[j].slug), own[j].slug.len, &hit)) {
-                t = arr_at(&tags, hit.off);
+            Sp hit_ti;
+            if (dict_get(&tag_by_slug, p, pool_at(p, own[j].slug), own[j].slug.len, &hit_ti)) {
+                t = arr_at(&tags, hit_ti.off);
             }
             TagRef *r = arr_slot(&tagref_store, p);
             if (t) { r->name = t->name; r->slug = t->slug; r->url = t->url; r->clean_mask = t->clean_mask; }
@@ -528,19 +536,16 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
         int64_t len = (int64_t)post_order.len;
         int64_t end = n < 0 ? (len + n > 0 ? len + n : 0) : (n < len ? n : len);
         if (end < 0) end = 0;
-        for (int64_t i = 0; i < end; i++) {
-            uint32_t *slot = arr_slot(recent_arr, p);
-            *slot = *(uint32_t *)arr_at(&post_order, (size_t)i);
+        if (end > 0) {
+            recent_arr->items = post_order.items;
+            recent_arr->len = (size_t)end;
+            recent_arr->cap = (size_t)end;
         }
     }
     for (size_t ti = 0; ti < tags.len; ti++) {
         Tag *t = arr_at(&tags, ti);
         Arr *arr = arr_slot(&card_arrays, p);
-        arr_new(arr, sizeof(uint32_t));
-        for (size_t k = 0; k < t->posts.len; k++) {
-            uint32_t *slot = arr_slot(arr, p);
-            *slot = *(uint32_t *)arr_at(&t->posts, k);
-        }
+        *arr = t->posts;
     }
     int64_t per = c->site.per_page < 1 ? 1 : c->site.per_page;
     int64_t npages = (int64_t)((post_order.len + (size_t)per - 1) / (size_t)per);
@@ -552,9 +557,10 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
         if (e > (int64_t)post_order.len) e = (int64_t)post_order.len;
         Arr *arr = arr_slot(&card_arrays, p);
         arr_new(arr, sizeof(uint32_t));
-        for (size_t i = start; i < (size_t)e; i++) {
-            uint32_t *slot = arr_slot(arr, p);
-            *slot = *(uint32_t *)arr_at(&post_order, i);
+        if ((size_t)e > start) {
+            arr->items = (uint32_t *)post_order.items + start;
+            arr->len = (size_t)e - start;
+            arr->cap = arr->len;
         }
         Sp url = idx_url(p, base, k);
         Sp newer_url = k == 1 ? SP_NONE : idx_url(p, base, k - 1);
@@ -564,8 +570,8 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
         pg->newer_url = newer_url; pg->older_url = older_url;
     }
 
-    static Pool cache_pool = {0, 0, 0, -1};
-    if (!cache_pool.base) pool_open(&cache_pool, 1 << 23); /* 8 MB virtual, ~200 KB touched */
+    static Pool cache_pool;
+    if (!cache_pool.base) pool_open(&cache_pool, 1 << 24); /* 16 MB virtual include cache pool */
     cache_pool.len = 0;
 
     Ctx st;
@@ -575,7 +581,8 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
     st.lazy_md = lazy_md;
     st.cur_html = 0;
     st.cur_html_len = 0;
-    st.cur_toc = 0;
+    Arr cur_toc; arr_new(&cur_toc, sizeof(Toc));
+    st.cur_toc = &cur_toc;
     st.site_title_clean = site_title_clean;
     st.site_base_clean = site_base_clean;
     tpl_cache_open(&st, p, &templates, pages.len);
@@ -583,15 +590,7 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
     st.site_base = base;
     st.pages = pages;
     st.post_order = post_order;
-    /* recent: a copy of card_arrays[0] */
-    arr_new(&st.recent, sizeof(uint32_t));
-    {
-        Arr *r0 = arr_at(&card_arrays, 0);
-        for (size_t i = 0; i < r0->len; i++) {
-            uint32_t *slot = arr_slot(&st.recent, p);
-            *slot = *(uint32_t *)arr_at(r0, i);
-        }
-    }
+    st.recent = *(Arr *)arr_at(&card_arrays, 0);
     st.tags = tags;
     st.tagref_store = tagref_store;
     st.toc_store = toc_store;
@@ -599,8 +598,17 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
     st.tagref_arrays = tagref_arrays;
     st.toc_arrays = toc_arrays;
     st.pagers = pagers;
+    tpl_optimize(&st, &templates);
 
     /* layouts: render into the answers object. */
+    bool any_static_html = false;
+    for (size_t si = 0; si < statics.len; si++) {
+        SpPair *sp = arr_at(&statics, si);
+        const uint8_t *sb = pool_at(p, sp->a);
+        if (sp->a.len >= 10 && eq_bytes(sb + sp->a.len - 10, "index.html", 10)) {
+            any_static_html = true; break;
+        }
+    }
     Arr written_keys; arr_new(&written_keys, sizeof(Sp));
     static Str tscratch; str_clear(&tscratch);
     Scope frames[128];
@@ -608,67 +616,117 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
     pool_u8(out, '{');
     bool first = true;
     /* Pages, in source order. */
-    Arr page_toc; arr_new(&page_toc, sizeof(Toc));
-    Page *pages_ptr = st.pages.len ? arr_at(&st.pages, 0) : 0;
-    RawFile *statics_ptr = statics.len ? arr_at(&statics, 0) : 0;
+    Sp prev_dir = {0xffffffffu, 0};
+    LinkCtx env;
+    env.pages = pages.len ? arr_at(&pages, 0) : 0;
+    env.npages = pages.len;
+    env.statics = statics.len ? arr_at(&statics, 0) : 0;
+    env.nstatics = statics.len;
+    env.page_map = &page_map;
+    env.static_set = &static_set;
+    env.base = base;
+    env.base_clean = site_base_clean;
+    env.dir = SP_NONE;
+    env.dir_np = 0;
+    env.dir_prefix_len[0] = 0;
+    env.broken = &broken;
+    env.path_buf = &path_buf;
+    env.item_buf = &item_buf;
+    env.item_scratch = &item_scratch;
     for (size_t pi = 0; pi < st.pages.len; pi++) {
         Page *pd = arr_at(&st.pages, pi);
-        if (pd->layout_tpl < 0) continue;
         if (lazy_md) {
-            LinkCtx env;
-            setup_link_env(p, &env, pages_ptr, st.pages.len, statics_ptr, statics.len,
-                           &page_map, &static_set, base, pd, &broken,
-                           &path_buf, &item_buf, &item_scratch);
-            arr_clear(&page_toc);
+            Sp dir = path_dir(p, pd->path);
+            if (prev_dir.off == 0xffffffffu || dir.len != prev_dir.len
+                || !eq_bytes(pool_at(p, dir), pool_at(p, prev_dir), dir.len)) {
+                prev_dir = dir;
+                env.dir = dir;
+                env.dir_clean = span_is_clean(p, dir);
+                env.dir_np = 0;
+                env.dir_prefix_len[0] = 0;
+                if (dir.len > 0) {
+                    const uint8_t *db = pool_at(p, dir);
+                    size_t ds = 0;
+                    for (size_t di = 0; di <= dir.len; di++) {
+                        if (di == dir.len || db[di] == '/') {
+                            if (env.dir_np < 64) {
+                                env.dir_parts[env.dir_np] = db + ds;
+                                env.dir_plens[env.dir_np] = di - ds;
+                                env.dir_np++;
+                                env.dir_prefix_len[env.dir_np] = di;
+                            }
+                            ds = di + 1;
+                        }
+                    }
+                }
+            }
+            env.src_path = pd->path;
+            arr_clear(&cur_toc);
             Sp html, excerpt;
-            md_build_buf(p, pool_at(p, pd->body), pd->body.len, &env, &md_slug_cache, &scratch, &tmp, &text_tmp, &html, &page_toc, &excerpt, md_pre_json, false);
+            md_build(p, pd->body, &env, &md_slug_cache, &scratch, &tmp, &text_tmp, &html, &cur_toc, &excerpt, md_pre_json, false);
             pd->excerpt = excerpt;
             st.cur_html = scratch.data;
-            st.cur_html_len = (uint32_t)scratch.len;
-            st.cur_toc = &page_toc;
+            st.cur_html_len = html.len;
         }
+        if (pd->layout_tpl < 0) continue;
         Tpl *tpl = arr_at(&templates, (size_t)pd->layout_tpl);
-        uint32_t kst = pool_mark(p);
-        pool_copy(p, pd->out_dir);
-        pool_put(p, (const uint8_t *)"/index.html", 11);
-        Sp key = pool_span(p, kst);
         if (!first) pool_u8(out, ',');
         first = false;
-        pool_u8(out, '"');
-        if (pd->clean_mask & 2) pool_put(out, pool_at(p, key), key.len);
-        else json_escape_into(out, pool_at(p, key), key.len);
-        pool_put(out, (const uint8_t *)"\":\"", 3);
-        Sp *wk = arr_slot(&written_keys, p);
-        *wk = key;
+        if (__builtin_expect(!any_static_html, 1)) {
+            pool_u8(out, '"');
+            if (pd->clean_mask & 2) pool_put(out, pool_at(p, pd->out_dir), pd->out_dir.len);
+            else json_escape_into(out, pool_at(p, pd->out_dir), pd->out_dir.len);
+            pool_put(out, (const uint8_t *)"/index.html\":\"", 14);
+        } else {
+            uint32_t kst = pool_mark(p);
+            pool_copy(p, pd->out_dir);
+            pool_put(p, (const uint8_t *)"/index.html", 11);
+            Sp key = pool_span(p, kst);
+            pool_u8(out, '"');
+            if (pd->clean_mask & 2) pool_put(out, pool_at(p, key), key.len);
+            else json_escape_into(out, pool_at(p, key), key.len);
+            pool_put(out, (const uint8_t *)"\":\"", 3);
+            Sp *wk = arr_slot(&written_keys, p);
+            *wk = key;
+        }
         nframes = 1;
         frames[0].is_root = true;
         frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
         frames[0].page = (int32_t)pi; frames[0].posts = -1; frames[0].pager = -1; frames[0].tag = -1;
-        tpl_emit(&st, &templates, &tpl->nodes, frames, &nframes, out, &tscratch, 0);
+        tpl_run(&st, &templates, tpl, frames, &nframes, out, &tscratch, 0);
         pool_u8(out, '"');
-        maybe_flush(out);
     }
     /* Index pages. */
     {
         Tpl *tpl_idx = tpl_find(&templates, p, (const uint8_t *)"index", 5);
         for (int64_t k = 1; tpl_idx && k <= npages; k++) {
-            Sp key;
-            if (k == 1) {
-                key = pool_store(p, (const uint8_t *)"index.html", 10);
-            } else {
-                uint32_t kst = pool_mark(p);
-                pool_put(p, (const uint8_t *)"page/", 5);
-                pool_i64(p, k);
-                pool_put(p, (const uint8_t *)"/index.html", 11);
-                key = pool_span(p, kst);
-            }
             if (!first) pool_u8(out, ',');
             first = false;
-            pool_u8(out, '"');
-            pool_put(out, pool_at(p, key), key.len);
-            pool_put(out, (const uint8_t *)"\":\"", 3);
-            Sp *wk = arr_slot(&written_keys, p);
-            *wk = key;
+            if (__builtin_expect(!any_static_html, 1)) {
+                if (k == 1) {
+                    pool_put(out, (const uint8_t *)"\"index.html\":\"", 14);
+                } else {
+                    pool_put(out, (const uint8_t *)"\"page/", 6);
+                    pool_i64(out, k);
+                    pool_put(out, (const uint8_t *)"/index.html\":\"", 14);
+                }
+            } else {
+                Sp key;
+                if (k == 1) {
+                    key = pool_store(p, (const uint8_t *)"index.html", 10);
+                } else {
+                    uint32_t kst = pool_mark(p);
+                    pool_put(p, (const uint8_t *)"page/", 5);
+                    pool_i64(p, k);
+                    pool_put(p, (const uint8_t *)"/index.html", 11);
+                    key = pool_span(p, kst);
+                }
+                pool_u8(out, '"');
+                pool_put(out, pool_at(p, key), key.len);
+                pool_put(out, (const uint8_t *)"\":\"", 3);
+                Sp *wk = arr_slot(&written_keys, p);
+                *wk = key;
+            }
             nframes = 1;
             frames[0].is_root = true;
             frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
@@ -676,9 +734,8 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
             frames[0].posts = (int32_t)(1 + st.tags.len + (size_t)(k - 1));
             frames[0].pager = (int32_t)(k - 1);
             frames[0].tag = -1;
-            tpl_emit(&st, &templates, &tpl_idx->nodes, frames, &nframes, out, &tscratch, 0);
+            tpl_run(&st, &templates, tpl_idx, frames, &nframes, out, &tscratch, 0);
             pool_u8(out, '"');
-            maybe_flush(out);
         }
     }
     /* Tag pages, in tag order. */
@@ -686,59 +743,79 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
         Tpl *tpl_tag = tpl_find(&templates, p, (const uint8_t *)"tag", 3);
         for (size_t ti = 0; tpl_tag && ti < st.tags.len; ti++) {
             Tag *t = arr_at(&st.tags, ti);
-            uint32_t kst = pool_mark(p);
-            pool_put(p, (const uint8_t *)"tags/", 5);
-            pool_copy(p, t->slug);
-            pool_put(p, (const uint8_t *)"/index.html", 11);
-            Sp key = pool_span(p, kst);
             if (!first) pool_u8(out, ',');
             first = false;
-            pool_u8(out, '"');
-            pool_put(out, pool_at(p, key), key.len);
-            pool_put(out, (const uint8_t *)"\":\"", 3);
-            Sp *wk = arr_slot(&written_keys, p);
-            *wk = key;
+            if (__builtin_expect(!any_static_html, 1)) {
+                pool_put(out, (const uint8_t *)"\"tags/", 6);
+                pool_put(out, pool_at(p, t->slug), t->slug.len);
+                pool_put(out, (const uint8_t *)"/index.html\":\"", 14);
+            } else {
+                uint32_t kst = pool_mark(p);
+                pool_put(p, (const uint8_t *)"tags/", 5);
+                pool_copy(p, t->slug);
+                pool_put(p, (const uint8_t *)"/index.html", 11);
+                Sp key = pool_span(p, kst);
+                pool_u8(out, '"');
+                pool_put(out, pool_at(p, key), key.len);
+                pool_put(out, (const uint8_t *)"\":\"", 3);
+                Sp *wk = arr_slot(&written_keys, p);
+                *wk = key;
+            }
             nframes = 1;
             frames[0].is_root = true;
             frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
             frames[0].page = -1; frames[0].posts = -1; frames[0].pager = -1;
             frames[0].tag = (int32_t)ti;
-            tpl_emit(&st, &templates, &tpl_tag->nodes, frames, &nframes, out, &tscratch, 0);
+            tpl_run(&st, &templates, tpl_tag, frames, &nframes, out, &tscratch, 0);
             pool_u8(out, '"');
-            maybe_flush(out);
         }
     }
     /* Tags index. */
     {
         Tpl *tpl = tpl_find(&templates, p, (const uint8_t *)"tags", 4);
         if (tpl) {
-            Sp key = pool_store(p, (const uint8_t *)"tags/index.html", 15);
             if (!first) pool_u8(out, ',');
             first = false;
             pool_put(out, (const uint8_t *)"\"tags/index.html\":\"", 19);
-            Sp *wk = arr_slot(&written_keys, p);
-            *wk = key;
+            if (__builtin_expect(any_static_html, 0)) {
+                Sp key = pool_store(p, (const uint8_t *)"tags/index.html", 15);
+                Sp *wk = arr_slot(&written_keys, p);
+                *wk = key;
+            }
             nframes = 1;
             frames[0].is_root = true;
             frames[0].name = SP_NONE; frames[0].value = val_void(); frames[0].lp = (LoopInfo){0, false, false, 0};
             frames[0].page = -1; frames[0].posts = -1; frames[0].pager = -1; frames[0].tag = -1;
-            tpl_emit(&st, &templates, &tpl->nodes, frames, &nframes, out, &tscratch, 0);
+            tpl_run(&st, &templates, tpl, frames, &nframes, out, &tscratch, 0);
             pool_u8(out, '"');
-            maybe_flush(out);
         }
     }
     /* Statics, in path order; shadowed ones are reported, not written. */
     if (statics.len > 0) {
         Set written_set; set_new(&written_set);
-        for (size_t k = 0; k < written_keys.len; k++) {
-            set_add(&written_set, p, *(Sp *)arr_at(&written_keys, k));
+        if (__builtin_expect(any_static_html, 0)) {
+            set_reserve(&written_set, p, written_keys.len + statics.len);
+            for (size_t k = 0; k < written_keys.len; k++) {
+                set_add(&written_set, p, *(Sp *)arr_at(&written_keys, k));
+            }
         }
         for (size_t i = 0; i < statics.len; i++) {
-            RawFile *sp = arr_at(&statics, i);
-            if (!set_add(&written_set, p, sp->path)) {
+            SpPair *sp = arr_at(&statics, i);
+            bool dup = false;
+            if (!any_static_html && statics.len <= 16) {
+                for (size_t q = 0; q < i; q++) {
+                    SpPair *prev = arr_at(&statics, q);
+                    if (prev->a.len == sp->a.len && eq_bytes(pool_at(p, prev->a), pool_at(p, sp->a), sp->a.len)) {
+                        dup = true; break;
+                    }
+                }
+            } else {
+                dup = !set_add(&written_set, p, sp->a);
+            }
+            if (dup) {
                 uint32_t st2 = pool_mark(p);
                 pool_put(p, (const uint8_t *)"shadowed ", 9);
-                pool_copy(p, sp->path);
+                pool_copy(p, sp->a);
                 pool_put(p, (const uint8_t *)": a built page has its path", 27);
                 Sp span_st2 = pool_span(p, st2);
                 Sp *line = arr_slot(&report, p);
@@ -748,15 +825,10 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
             if (!first) pool_u8(out, ',');
             first = false;
             pool_u8(out, '"');
-            json_escape_into(out, pool_at(p, sp->path), sp->path.len);
+            json_escape_into(out, pool_at(p, sp->a), sp->a.len);
             pool_put(out, (const uint8_t *)"\":\"", 3);
-            if ((sp->flags & RF_NO_ESC) && scan_json_esc(pool_at(p, sp->content), sp->content.len, 0) < 0) {
-                pool_put(out, pool_at(p, sp->content), sp->content.len);
-            } else {
-                json_escape_into(out, pool_at(p, sp->content), sp->content.len);
-            }
+            json_escape_into(out, pool_at(p, sp->b), sp->b.len);
             pool_u8(out, '"');
-            maybe_flush(out);
         }
     }
     /* report: sorted lines (broken links deduped) + the counts line. */
@@ -828,18 +900,18 @@ bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out) {
 bool cases_build(Pool *p, const uint8_t *input, size_t n, Pool *out) {
     Cur cur = {input, p, 0, n};
     if (!json_all_begin(&cur)) return false;
-    size_t reset_len = p->len;
+    size_t reset_len = (input == p->base) ? p->len : 0;
     pool_u8(out, '[');
     bool first = true;
     for (;;) {
         p->len = reset_len;
         CaseInput c;
-        int st = json_all_next(&cur, &c);
-        if (st < 0) return false;
-        if (st == 0) break;
+        int rc = json_all_next(&cur, &c);
+        if (rc < 0) return false;
+        if (rc == 0) break;
         if (!first) pool_u8(out, ',');
         first = false;
-        if (!case_build(p, input, &c, out)) return false;
+        if (!case_build(p, &c, out)) return false;
     }
     pool_u8(out, ']');
     return true;

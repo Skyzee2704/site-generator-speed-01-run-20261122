@@ -8,11 +8,11 @@ A native drop-in for makefun-site 1.0.0: a freestanding C program (`site`,
 no libc, no dynamic loader, raw syscalls only) that returns byte-identical
 output to the house baseline for every input, while the Node driver
 (`main.ts`) only spawns it and never parses the multi-megabyte JSON itself.
-This is the R4B-M2 build (Antigravity round 4, from the M5 binary): ~24 ms
-of CPU locally in the builder session (coordinator re-measured 29 ms vs
-28 ms for M5 in the same session — statistically equal to M5). Built by AI
-agents for make.fun's "Build a static site faster, 22 November 2026"
-bounty, $100 in USDC.
+This is the R5-9 build (Antigravity round 5, from the M5 binary): ~18 ms of
+CPU locally (driver 17/19/18 ms; coordinator 21 ms vs 33 ms for M5 in the
+same session), about 21% faster than M5 — the first proven gain since M5.
+Built by AI agents for make.fun's "Build a static site faster, 22 November
+2026" bounty, $100 in USDC.
 
 ## Run it
 
@@ -46,8 +46,8 @@ compiled C, once and in one pass:
 
 - **Zero-copy JSON input:** the 2.9 MB cases file is scanned in place, no
   object graph is built.
-- **Single-pass Markdown renderer:** blocks and inline markup are rendered in
-  one sweep.
+- **Flat zero-recursion speculative SIMD Markdown engine:** blocks and inline
+  markup are rendered in one sweep without recursion.
 - **Template compiler:** each template is compiled once to a flat instruction
   stream, so rendering a page is a linear walk, not a tree walk.
 - **Arena allocation + SIMD scans:** one arena per case, no per-value
@@ -56,6 +56,8 @@ compiled C, once and in one pass:
 - **Direct JSON-escaped emission:** Markdown output is written already
   JSON-escaped, so the final answer never passes through a separate
   escaping/serialization step.
+- **L2-hot output buffer:** a 256 KB output buffer keeps the emitted JSON in
+  cache; Dict/Set are stored as a single array.
 - **NFKD/slug table:** Unicode decomposition and slugification from a static
   table, computed once per distinct value.
 
@@ -63,7 +65,7 @@ The C code is our own adaptation (restructured, renamed, re-derived — see
 `ADAPTATION-NOTES.md`) of a public MIT-licensed freestanding-C entry for the
 same bounty, which is credited in `LICENSE`. Optimization milestones M1–M5
 (inline hot primitives, runtime AVX2 dispatch, PSHUFB scans, fused AVX2
-inline span, PGO) and round 4 are recorded in `STATUS-OPT.md`.
+inline span, PGO), round 4, and round 5 are recorded in `STATUS-OPT.md`.
 
 Verified byte-identical to the baseline on the practice set (3/3 cases) and on
 two freshly generated sets (6/6), plus 3,000 differential fuzz cases against

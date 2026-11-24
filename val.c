@@ -156,7 +156,7 @@ size_t ctx_arr_len(Ctx *c, uint8_t kind, uint32_t idx) {
             return r->len;
         }
         case A_TOC: {
-            if (c->lazy_md) return c->cur_toc ? c->cur_toc->len : 0;
+            if (c->lazy_md) return c->cur_toc->len;
             Range *r = arr_at(&c->toc_arrays, idx);
             return r->len;
         }
@@ -262,7 +262,7 @@ Val val_field(Ctx *c, Val v, uint8_t f) {
                 }
             }
             case O_TOC: {
-                Toc *t = c->lazy_md ? (Toc *)arr_at(c->cur_toc, v.idx) : (Toc *)arr_at(&c->toc_store, v.idx);
+                Toc *t = c->lazy_md ? arr_at(c->cur_toc, v.idx) : arr_at(&c->toc_store, v.idx);
                 switch (f) {
                     case F_LEVEL: return val_int(t->level);
                     case F_ID: return val_str_json(t->id);

@@ -2,7 +2,7 @@
  * Usage: site <cases.json> <answers.json>
  * Maps the input file read-only (zero-copy, MAP_POPULATE) with a read
  * fallback for non-regular files, and streams answers directly into a
- * 256 KB L2-resident output buffer flushed to the output fd. */
+ * 512 KB output buffer flushed to the output fd. */
 #include "zg.h"
 
 #define O_RDONLY 0
@@ -37,7 +37,7 @@ int entry_main(long *sp) {
     if (fd < 0) fail("site: cannot open input\n");
 
     Pool pool, out;
-    pool_open(&pool, 1 << 26); /* 64 MB virtual working pool (only touched pages fault) */
+    pool_open(&pool, 1 << 26);  /* 64 MB working pool (virtual; only touched pages fault) */
 
     const uint8_t *buf = 0;
     size_t len = 0;
@@ -64,15 +64,16 @@ int entry_main(long *sp) {
 
     long ofd = os_open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (ofd < 0) fail("site: cannot open output\n");
-    pool_open_stream(&out, 128 * 1024, (int)ofd);
+    pool_open_stream(&out, 256 * 1024, (int)ofd);
 
+    /* Single-object input (solve.js one-case mode): wrap as one case. */
     size_t i = 0;
     while (i < len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r')) i++;
     if (i < len && buf[i] == '{') {
         Cur cur = {buf, &pool, 0, len};
         CaseInput c;
         if (!json_read_case(&cur, &c)) fail("site: bad input\n");
-        if (!case_build(&pool, buf, &c, &out)) fail("site: build failed\n");
+        if (!case_build(&pool, &c, &out)) fail("site: build failed\n");
     } else {
         if (!cases_build(&pool, buf, len, &out)) fail("site: build failed\n");
     }

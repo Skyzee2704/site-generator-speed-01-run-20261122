@@ -146,14 +146,16 @@ M3 29 → M4 29–30 → M5 24 ms (driver session); coordinator re-measured M5 a
 also verified correct (9/9 + fuzz 3000) at 30 ms, so the entry stays correct
 and fast even on a CPU without AVX2.
 
-## Round 4 — R4B-M2 (Antigravity, 24 Nov 2026)
+## Round 5 — R5-9 (Antigravity, 24 Nov 2026)
 
-Round 4 (two chunks, both killed by the 30-minute print timeout) produced
-M6, R4B-M1 and R4B-M2 from the M5 source. R4B-M1 (22 ms) has no source
-snapshot and is not submitted. R4B-M2 (24 ms local in the driver session;
-coordinator re-measured 29 ms vs M5's 28 ms in the same session —
-statistically equal to M5) is the clean candidate: its source snapshot
-(`src-m2-backup/`, 12 files + the unchanged `entry.S` startup stub) matches
-the binary, and it was verified byte-identical on practice 3/3 + two fresh
-sets 6/6 + 3,000 differential fuzz cases. It replaces the M5 entry
-(rank 31 @ 70,000 µs) as the counting submission.
+Round 5 (five runs; run 1 killed by a VM replacement, runs 2 and 4 by the
+25-minute print timeout) produced R5-1 through R5-9 from the M5 source.
+R5-9 is the first proven gain since M5: 17/19/18 ms local in the driver
+session (coordinator re-measured 21 ms vs M5's 33 ms in the same session),
+about -21% vs M5, above the ±15 spread. Techniques: flat zero-recursion
+speculative SIMD Markdown engine, Dict/Set as one array, 256 KB L2-hot
+output buffer, multi-ISA PGO. Source snapshot is `.work/src-r5-9/`
+(14 files); the lane root was later edited by round 6, so the snapshot —
+not the lane root — is the R5-9 source. Verified byte-identical on
+practice 3/3 + two fresh sets 6/6 + 3,000 differential fuzz cases.
+It replaces the M2 entry (rank 43 @ 90,000 µs) as the counting submission.

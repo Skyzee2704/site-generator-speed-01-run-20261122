@@ -259,7 +259,8 @@ typedef struct { uint8_t kind; Sp span; bool raw; } Tok;
 static bool lex_tokens(Pool *p, Sp name, Sp src, Arr *toks_out, Sp *err) {
     arr_new(toks_out, sizeof(Tok));
     size_t off = src.off, len = src.len, end = off + len;
-    static Str text; str_clear(&text);
+    static Str text;
+    str_clear(&text);
     size_t i = off;
     static const uint8_t brace[1] = {'{'};
     while (i < end) {
@@ -621,32 +622,21 @@ static void dep_collect_ref(Pool *p, Ref *rf, Arr *deps, bool *bad_loop) {
     }
 }
 
-static bool ref_uses_card_md(Ref *rf) {
-    if (rf->kind != REF_SCOPE && rf->kind != REF_DYN) return false;
-    for (uint8_t i = 0; i < rf->chain_len; i++) {
-        if (rf->chain[i] == F_EXCERPT || rf->chain[i] == F_READING_MINUTES) return true;
-    }
-    return false;
-}
-
-static void dep_collect_nodes(Pool *p, Arr *nodes, Arr *deps, bool *bad_loop, bool *uses_card_md) {
+static void dep_collect_nodes(Pool *p, Arr *nodes, Arr *deps, bool *bad_loop) {
     for (size_t i = 0; i < nodes->len; i++) {
         Node *s = arr_at(nodes, i);
         switch (s->kind) {
             case ND_VAR:
                 dep_collect_ref(p, &s->u.var.ref, deps, bad_loop);
-                if (ref_uses_card_md(&s->u.var.ref)) *uses_card_md = true;
                 break;
             case ND_IF:
                 dep_collect_ref(p, &s->u.nif.ref, deps, bad_loop);
-                if (ref_uses_card_md(&s->u.nif.ref)) *uses_card_md = true;
-                dep_collect_nodes(p, &s->u.nif.then_nodes, deps, bad_loop, uses_card_md);
-                dep_collect_nodes(p, &s->u.nif.else_nodes, deps, bad_loop, uses_card_md);
+                dep_collect_nodes(p, &s->u.nif.then_nodes, deps, bad_loop);
+                dep_collect_nodes(p, &s->u.nif.else_nodes, deps, bad_loop);
                 break;
             case ND_FOR:
                 dep_collect_ref(p, &s->u.nfor.ref, deps, bad_loop);
-                if (ref_uses_card_md(&s->u.nfor.ref)) *uses_card_md = true;
-                dep_collect_nodes(p, &s->u.nfor.body, deps, bad_loop, uses_card_md);
+                dep_collect_nodes(p, &s->u.nfor.body, deps, bad_loop);
                 break;
             default:
                 break;
@@ -675,7 +665,7 @@ static void include_resolve_all(Pool *p, Arr *templates, Arr *nodes) {
     }
 }
 
-static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, bool *any_bad, bool *any_card_md) {
+static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, bool *any_bad) {
     bool changed = false;
     for (size_t i = 0; i < nodes->len; i++) {
         Node *s = arr_at(nodes, i);
@@ -684,7 +674,6 @@ static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, b
             if (k >= 0) {
                 Tpl *u = arr_at(templates, (size_t)k);
                 if (!u->cacheable) *any_bad = true;
-                if (u->uses_card_md) *any_card_md = true;
                 size_t before = deps->len;
                 for (size_t j = 0; j < u->needs.len; j++) {
                     TplNeed *d = arr_at(&u->needs, j);
@@ -693,13 +682,50 @@ static bool dep_union_includes(Pool *p, Arr *templates, Arr *nodes, Arr *deps, b
                 if (deps->len != before) changed = true;
             }
         } else if (s->kind == ND_IF) {
-            if (dep_union_includes(p, templates, &s->u.nif.then_nodes, deps, any_bad, any_card_md)) changed = true;
-            if (dep_union_includes(p, templates, &s->u.nif.else_nodes, deps, any_bad, any_card_md)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nif.then_nodes, deps, any_bad)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nif.else_nodes, deps, any_bad)) changed = true;
         } else if (s->kind == ND_FOR) {
-            if (dep_union_includes(p, templates, &s->u.nfor.body, deps, any_bad, any_card_md)) changed = true;
+            if (dep_union_includes(p, templates, &s->u.nfor.body, deps, any_bad)) changed = true;
         }
     }
     return changed;
+}
+
+static bool nodes_use_card_excerpt(Arr *nodes) {
+    for (size_t i = 0; i < nodes->len; i++) {
+        Node *s = arr_at(nodes, i);
+        if (s->kind == ND_VAR || s->kind == ND_IF || s->kind == ND_FOR) {
+            Ref *rf = s->kind == ND_VAR ? &s->u.var.ref : (s->kind == ND_IF ? &s->u.nif.ref : &s->u.nfor.ref);
+            if (!(rf->kind == REF_ROOT && rf->root_field == RF_PAGE)) {
+                for (uint8_t c = 0; c < rf->chain_len; c++) {
+                    if (rf->chain[c] == F_EXCERPT) return true;
+                }
+            }
+            if (s->kind == ND_IF) {
+                if (nodes_use_card_excerpt(&s->u.nif.then_nodes)) return true;
+                if (nodes_use_card_excerpt(&s->u.nif.else_nodes)) return true;
+            } else if (s->kind == ND_FOR) {
+                if (nodes_use_card_excerpt(&s->u.nfor.body)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool nodes_include_uses_card_excerpt(Arr *templates, Arr *nodes) {
+    for (size_t i = 0; i < nodes->len; i++) {
+        Node *s = arr_at(nodes, i);
+        if (s->kind == ND_INCLUDE && s->u.ninc.tpl_idx >= 0) {
+            Tpl *u = arr_at(templates, (size_t)s->u.ninc.tpl_idx);
+            if (u->uses_card_excerpt) return true;
+        } else if (s->kind == ND_IF) {
+            if (nodes_include_uses_card_excerpt(templates, &s->u.nif.then_nodes)) return true;
+            if (nodes_include_uses_card_excerpt(templates, &s->u.nif.else_nodes)) return true;
+        } else if (s->kind == ND_FOR) {
+            if (nodes_include_uses_card_excerpt(templates, &s->u.nfor.body)) return true;
+        }
+    }
+    return false;
 }
 
 void tpl_analyze(Pool *p, Arr *templates) {
@@ -707,20 +733,18 @@ void tpl_analyze(Pool *p, Arr *templates) {
         Tpl *t = arr_at(templates, k);
         arr_new(&t->needs, sizeof(TplNeed));
         t->cacheable = 1;
-        t->uses_card_md = 0;
-        bool bad = false, ucmd = false;
-        dep_collect_nodes(p, &t->nodes, &t->needs, &bad, &ucmd);
+        t->uses_card_excerpt = nodes_use_card_excerpt(&t->nodes) ? 1 : 0;
+        bool bad = false;
+        dep_collect_nodes(p, &t->nodes, &t->needs, &bad);
         if (bad) t->cacheable = 0;
-        if (ucmd) t->uses_card_md = 1;
     }
     for (int iter = 0; iter < 16; iter++) {
         bool changed = false;
         for (size_t k = 0; k < templates->len; k++) {
             Tpl *t = arr_at(templates, k);
-            bool bad = false, ucmd = false;
-            if (dep_union_includes(p, templates, &t->nodes, &t->needs, &bad, &ucmd)) changed = true;
+            bool bad = false;
+            if (dep_union_includes(p, templates, &t->nodes, &t->needs, &bad)) changed = true;
             if (bad && t->cacheable) { t->cacheable = 0; changed = true; }
-            if (ucmd && !t->uses_card_md) { t->uses_card_md = 1; changed = true; }
         }
         if (!changed) break;
     }
@@ -759,6 +783,17 @@ void tpl_analyze(Pool *p, Arr *templates) {
     for (size_t k = 0; k < templates->len; k++) {
         Tpl *t = arr_at(templates, k);
         include_resolve_all(p, templates, &t->nodes);
+    }
+    for (int iter = 0; iter < 16; iter++) {
+        bool changed = false;
+        for (size_t k = 0; k < templates->len; k++) {
+            Tpl *t = arr_at(templates, k);
+            if (!t->uses_card_excerpt && nodes_include_uses_card_excerpt(templates, &t->nodes)) {
+                t->uses_card_excerpt = 1;
+                changed = true;
+            }
+        }
+        if (!changed) break;
     }
 }
 
@@ -966,35 +1001,41 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                 break;
             }
             case ND_INCLUDE: {
-                if (depth < INCLUDE_DEPTH && seg->u.ninc.tpl_idx >= 0) {
+                uint32_t eff_depth = depth + (uint32_t)seg->u.ninc.depth_add;
+                if (eff_depth < INCLUDE_DEPTH && seg->u.ninc.tpl_idx >= 0) {
                     size_t k = (size_t)seg->u.ninc.tpl_idx;
                     Tpl *t = arr_at(templates, k);
-                    Pool *cp = c->cache_pool;
                     if (t->cache_mode == 1) {
-                        Sp *slot = &c->tpl_global[k * INCLUDE_DEPTH + depth];
+                        Sp *slot = &c->tpl_global[k * INCLUDE_DEPTH + eff_depth];
                         if (__builtin_expect(slot->off != 0xffffffffu, 1)) {
-                            pool_put(out, cp->base + slot->off, slot->len);
+                            pool_put(out, pool_at(c->cache_pool, *slot), slot->len);
+                        } else if (out == c->cache_pool) {
+                            uint32_t start = pool_mark(out);
+                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, eff_depth + 1);
+                            *slot = pool_span(out, start);
                         } else {
-                            uint32_t start = pool_mark(cp);
-                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, cp, scratch, depth + 1);
-                            Sp span = pool_span(cp, start);
-                            *slot = span;
-                            if (out != cp) pool_put(out, cp->base + span.off, span.len);
+                            uint32_t start = pool_mark(c->cache_pool);
+                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, c->cache_pool, scratch, eff_depth + 1);
+                            *slot = pool_span(c->cache_pool, start);
+                            pool_put(out, pool_at(c->cache_pool, *slot), slot->len);
                         }
                         break;
                     }
-                    if (t->cache_mode == 2 && depth == 0 && c->tpl_card_cache) {
+                    if (t->cache_mode == 2 && eff_depth == 0 && c->tpl_card_cache) {
                         Val dv = dep_value_dyn(c, scopes, *nscopes, t->dyn_name);
                         if (__builtin_expect(dv.kind == K_OBJ && dv.akind == O_CARD && dv.idx < c->pages.len, 1)) {
                             Sp *slot = &c->tpl_card_cache[(size_t)t->card_slot * c->pages.len + dv.idx];
                             if (__builtin_expect(slot->off != 0xffffffffu, 1)) {
-                                pool_put(out, cp->base + slot->off, slot->len);
+                                pool_put(out, pool_at(c->cache_pool, *slot), slot->len);
+                            } else if (out == c->cache_pool) {
+                                uint32_t start = pool_mark(out);
+                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, eff_depth + 1);
+                                *slot = pool_span(out, start);
                             } else {
-                                uint32_t start = pool_mark(cp);
-                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, cp, scratch, depth + 1);
-                                Sp span = pool_span(cp, start);
-                                *slot = span;
-                                if (out != cp) pool_put(out, cp->base + span.off, span.len);
+                                uint32_t start = pool_mark(c->cache_pool);
+                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, c->cache_pool, scratch, eff_depth + 1);
+                                *slot = pool_span(c->cache_pool, start);
+                                pool_put(out, pool_at(c->cache_pool, *slot), slot->len);
                             }
                             break;
                         }
@@ -1002,7 +1043,7 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                     if (t->cache_mode != 0 && c->tpl_index) {
                         uint64_t h = 1469598103934665603ULL;
                         h ^= (uint64_t)k; h *= 1099511628211ULL;
-                        h ^= (uint64_t)(depth + 1); h *= 1099511628211ULL;
+                        h ^= (uint64_t)(eff_depth + 1); h *= 1099511628211ULL;
                         Val keys[8];
                         uint8_t nk = (uint8_t)t->needs.len;
                         for (uint8_t di = 0; di < nk; di++) {
@@ -1015,23 +1056,30 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                         bool hit = false;
                         while (c->tpl_index[slot] >= 0) {
                             TplHit *e = arr_at(&c->tpl_entries, (size_t)c->tpl_index[slot]);
-                            if (e->hash == h && e->tpl_idx == (uint32_t)k && e->depth == (uint8_t)(depth + 1) && e->nkeys == nk) {
+                            if (e->hash == h && e->tpl_idx == (uint32_t)k && e->depth == (uint8_t)(eff_depth + 1) && e->nkeys == nk) {
                                 bool eq = true;
                                 for (uint8_t di = 0; di < nk; di++) if (!val_equal(e->keys[di], keys[di])) { eq = false; break; }
                                 if (eq) {
-                                    pool_put(out, cp->base + e->bytes.off, e->bytes.len); hit = true; break;
+                                    pool_put(out, pool_at(c->cache_pool, e->bytes), e->bytes.len); hit = true; break;
                                 }
                             }
                             slot = (slot + 1) & mask;
                         }
                         if (!hit) {
-                            uint32_t start = pool_mark(cp);
-                            tpl_emit(c, templates, &t->nodes, scopes, nscopes, cp, scratch, depth + 1);
-                            Sp span = pool_span(cp, start);
-                            if (out != cp) pool_put(out, cp->base + span.off, span.len);
+                            Sp span;
+                            if (out == c->cache_pool) {
+                                uint32_t start = pool_mark(out);
+                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, eff_depth + 1);
+                                span = pool_span(out, start);
+                            } else {
+                                uint32_t start = pool_mark(c->cache_pool);
+                                tpl_emit(c, templates, &t->nodes, scopes, nscopes, c->cache_pool, scratch, eff_depth + 1);
+                                span = pool_span(c->cache_pool, start);
+                                pool_put(out, pool_at(c->cache_pool, span), span.len);
+                            }
                             if (c->tpl_entries.len < 4096) {
                                 TplHit *e = arr_slot(&c->tpl_entries, c->pool);
-                                e->hash = h; e->tpl_idx = (uint32_t)k; e->depth = (uint8_t)(depth + 1);
+                                e->hash = h; e->tpl_idx = (uint32_t)k; e->depth = (uint8_t)(eff_depth + 1);
                                 e->nkeys = nk; e->bytes = span;
                                 for (uint8_t di = 0; di < nk; di++) e->keys[di] = keys[di];
                                 size_t s2 = (size_t)h & mask;
@@ -1040,7 +1088,7 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
                             }
                         }
                     } else {
-                        tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, depth + 1);
+                        tpl_emit(c, templates, &t->nodes, scopes, nscopes, out, scratch, eff_depth + 1);
                     }
                 }
                 break;
@@ -1048,5 +1096,962 @@ void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes
             default:
                 break;
         }
+    }
+}
+
+/* Compile-time template optimization:
+ * - Constant-fold `{{ site.title }}` / `{{ site.base_url }}` (both raw & escaped).
+ * - Pre-render `cache_mode == 1` (global) includes into static text blobs.
+ * - Inline small `cache_mode == 0` includes (like `head`, `meta`, `toc`, `aside-*`)
+ *   while preserving exact `INCLUDE_DEPTH` semantics via `depth_add`.
+ * - Coalesce all adjacent `ND_TEXT` nodes into single contiguous spans. */
+static void opt_push_text(Pool *p, Arr *out, const uint8_t *bytes, size_t len) {
+    if (len == 0) return;
+    if (out->len > 0) {
+        Node *prev = arr_at(out, out->len - 1);
+        if (prev->kind == ND_TEXT) {
+            if (prev->u.text.off + prev->u.text.len == p->len) {
+                pool_put(p, bytes, len);
+                prev->u.text.len += (uint32_t)len;
+                return;
+            }
+            uint32_t st = pool_mark(p);
+            pool_copy(p, prev->u.text);
+            pool_put(p, bytes, len);
+            prev->u.text = pool_span(p, st);
+            return;
+        }
+    }
+    Node *nd = arr_slot(out, p);
+    nd->kind = ND_TEXT;
+    nd->u.text = pool_store(p, bytes, len);
+}
+
+static void opt_nodes(Ctx *c, Arr *templates, Arr *orig_nodes, Arr *in_nodes, Arr *out,
+                      uint32_t depth, Str *scratch, uint32_t *budget,
+                      bool in_card_tpl, Sp card_dyn_name) {
+    Pool *p = c->pool;
+    for (size_t i = 0; i < in_nodes->len; i++) {
+        Node *seg = arr_at(in_nodes, i);
+        switch (seg->kind) {
+            case ND_TEXT:
+                opt_push_text(p, out, pool_at(p, seg->u.text), seg->u.text.len);
+                break;
+            case ND_VAR: {
+                Ref *rf = &seg->u.var.ref;
+                if (rf->kind == REF_ROOT && rf->root_field == RF_SITE && rf->chain_len == 1
+                    && (rf->chain[0] == F_TITLE || rf->chain[0] == F_BASE_URL)) {
+                    Val v = val_field(c, val_obj(O_SITE, 0), rf->chain[0]);
+                    uint32_t st = pool_mark(c->cache_pool);
+                    val_write(c, v, c->cache_pool, !seg->raw, scratch);
+                    Sp rendered = pool_span(c->cache_pool, st);
+                    opt_push_text(p, out, pool_at(c->cache_pool, rendered), rendered.len);
+                    break;
+                }
+                Node *nd = arr_slot(out, p);
+                *nd = *seg;
+                break;
+            }
+            case ND_IF: {
+                Arr then_opt, else_opt;
+                arr_new(&then_opt, sizeof(Node));
+                arr_new(&else_opt, sizeof(Node));
+                opt_nodes(c, templates, orig_nodes, &seg->u.nif.then_nodes, &then_opt, depth, scratch, budget, in_card_tpl, card_dyn_name);
+                if (seg->has_else) {
+                    opt_nodes(c, templates, orig_nodes, &seg->u.nif.else_nodes, &else_opt, depth, scratch, budget, in_card_tpl, card_dyn_name);
+                }
+                Node *nd = arr_slot(out, p);
+                *nd = *seg;
+                nd->u.nif.then_nodes = then_opt;
+                nd->u.nif.else_nodes = else_opt;
+                break;
+            }
+            case ND_FOR: {
+                Arr body_opt;
+                arr_new(&body_opt, sizeof(Node));
+                opt_nodes(c, templates, orig_nodes, &seg->u.nfor.body, &body_opt, depth, scratch, budget, in_card_tpl, card_dyn_name);
+                Node *nd = arr_slot(out, p);
+                *nd = *seg;
+                nd->u.nfor.body = body_opt;
+                break;
+            }
+            case ND_INCLUDE: {
+                uint32_t eff_depth = depth + (uint32_t)seg->u.ninc.depth_add;
+                if (eff_depth >= INCLUDE_DEPTH || seg->u.ninc.tpl_idx < 0) {
+                    /* Always emits nothing! */
+                    break;
+                }
+                size_t k = (size_t)seg->u.ninc.tpl_idx;
+                Tpl *u = arr_at(templates, k);
+                if (u->cache_mode == 1) {
+                    Sp *slot = &c->tpl_global[k * INCLUDE_DEPTH + eff_depth];
+                    if (slot->off == 0xffffffffu) {
+                        Scope frames[16];
+                        frames[0].is_root = true;
+                        frames[0].name = SP_NONE; frames[0].value = val_void();
+                        frames[0].lp = (LoopInfo){0, false, false, 0};
+                        frames[0].page = -1; frames[0].posts = -1; frames[0].pager = -1; frames[0].tag = -1;
+                        size_t nf = 1;
+                        uint32_t st = pool_mark(c->cache_pool);
+                        tpl_emit(c, templates, &u->nodes, frames, &nf, c->cache_pool, scratch, eff_depth + 1);
+                        *slot = pool_span(c->cache_pool, st);
+                    }
+                    opt_push_text(p, out, pool_at(c->cache_pool, *slot), slot->len);
+                    break;
+                }
+                Arr *u_orig = arr_at(orig_nodes, k);
+                bool can_inline_same_card = in_card_tpl && u->cache_mode == 2
+                    && u->dyn_name.len == card_dyn_name.len
+                    && eq_bytes(pool_at(p, u->dyn_name), pool_at(p, card_dyn_name), card_dyn_name.len);
+                if ((u->cache_mode == 0 || can_inline_same_card) && u_orig->len <= 48 && *budget > u_orig->len) {
+                    *budget -= (uint32_t)u_orig->len;
+                    opt_nodes(c, templates, orig_nodes, u_orig, out, eff_depth + 1, scratch, budget, in_card_tpl, card_dyn_name);
+                    break;
+                }
+                Node *nd = arr_slot(out, p);
+                *nd = *seg;
+                nd->u.ninc.depth_add = (uint8_t)eff_depth;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+/* ---------------- Flat bytecode compiler & direct-pointer streaming VM ---------------- */
+
+enum OpKind {
+    OP_TEXT,
+    OP_PAGE_STR,
+    OP_PAGE_CONTENT,
+    OP_PAGE_INT,
+    OP_PAGE_LINK_STR,
+    OP_IF_PAGE_JMP,
+    OP_TAG_STR,
+    OP_TAG_INT,
+    OP_IF_TAG_JMP,
+    OP_PAGER_STR,
+    OP_PAGER_INT,
+    OP_IF_PAGER_JMP,
+    OP_SCOPE_STR,
+    OP_SCOPE_INT,
+    OP_IF_SCOPE_JMP,
+    OP_IF_LOOP_JMP,
+    OP_JMP,
+    OP_FOR_BEGIN,
+    OP_FOR_NEXT,
+    OP_INCLUDE_CARD,
+    OP_VAR_GEN,
+    OP_IF_GEN_JMP,
+    OP_INCLUDE_GEN
+};
+
+enum ForListKind {
+    FL_PAGE_TAGS = 0,
+    FL_PAGE_TOC  = 1,
+    FL_POSTS     = 2,
+    FL_TAG_POSTS = 3,
+    FL_TAGS      = 4,
+    FL_RECENT    = 5,
+    FL_GEN       = 6
+};
+
+typedef struct {
+    uint8_t op;
+    uint8_t a;
+    uint8_t b;
+    uint8_t c;
+    uint32_t off;  /* OP_TEXT offset / OP_INCLUDE_CARD tpl_idx / jmp target */
+    uint32_t len;  /* OP_TEXT len / OP_INCLUDE_CARD card_slot */
+    Node *node;    /* fallback node pointer for *_GEN / OP_FOR_BEGIN */
+} Instr;
+
+typedef struct {
+    Sp binder;
+    uint8_t obj_kind; /* O_TAGREF, O_TOC, O_CARD, O_TAGSUM, or 0xff (unknown) */
+    uint32_t begin_pc;
+    bool need_scope;
+} CompLoop;
+
+typedef struct {
+    Ctx *c;
+    Pool *p;
+    Arr *templates;
+    Arr *code;
+    bool is_card_mode;
+    Sp card_dyn;
+    CompLoop loops[8];
+    int ldepth;
+} CompCtx;
+
+static void comp_mark_scopes(CompCtx *cc) {
+    for (int i = 0; i < cc->ldepth; i++) cc->loops[i].need_scope = true;
+}
+
+static Instr *comp_emit(CompCtx *cc, uint8_t op) {
+    Instr *ins = arr_slot(cc->code, cc->p);
+    ins->op = op;
+    return ins;
+}
+
+static bool is_card_field_ok(uint8_t f) {
+    return f == F_TITLE || f == F_URL || f == F_DATE || f == F_DATE_LONG
+        || f == F_SUMMARY || f == F_EXCERPT || f == F_READING_MINUTES || f == F_TAGS;
+}
+
+/* Check if ref accesses cur_page (either RF_PAGE in normal mode, or card_dyn in card mode). */
+static bool ref_is_page_obj(CompCtx *cc, Ref *rf) {
+    if (!cc->is_card_mode) return rf->kind == REF_ROOT && rf->root_field == RF_PAGE;
+    if (rf->kind == REF_DYN && rf->name.len == cc->card_dyn.len
+        && eq_bytes(pool_at(cc->p, rf->name), pool_at(cc->p, cc->card_dyn), cc->card_dyn.len)) {
+        /* Make sure no enclosing for-loop shadows card_dyn */
+        for (int i = 0; i < cc->ldepth; i++) {
+            if (cc->loops[i].binder.len == cc->card_dyn.len
+                && eq_bytes(pool_at(cc->p, cc->loops[i].binder), pool_at(cc->p, cc->card_dyn), cc->card_dyn.len))
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+static int comp_find_scope(CompCtx *cc, Ref *rf) {
+    if (rf->kind != REF_SCOPE) return -1;
+    if ((int)rf->offset >= cc->ldepth) return -1;
+    int slot = cc->ldepth - 1 - (int)rf->offset;
+    if (rf->is_loop) return slot;
+    if (cc->loops[slot].binder.len == rf->name.len
+        && eq_bytes(pool_at(cc->p, cc->loops[slot].binder), pool_at(cc->p, rf->name), rf->name.len))
+        return slot;
+    return -1;
+}
+
+static void comp_nodes(CompCtx *cc, Arr *nodes) {
+    for (size_t i = 0; i < nodes->len; i++) {
+        Node *seg = arr_at(nodes, i);
+        switch (seg->kind) {
+            case ND_TEXT: {
+                if (seg->u.text.len == 0) break;
+                Instr *ins = comp_emit(cc, OP_TEXT);
+                ins->off = seg->u.text.off;
+                ins->len = seg->u.text.len;
+                break;
+            }
+            case ND_VAR: {
+                Ref *rf = &seg->u.var.ref;
+                uint8_t esc = seg->raw ? 0 : 1;
+                if (ref_is_page_obj(cc, rf)) {
+                    if (rf->chain_len == 1) {
+                        uint8_t f = rf->chain[0];
+                        if (!cc->is_card_mode || is_card_field_ok(f)) {
+                            if (f == F_TITLE || f == F_URL || f == F_DATE || f == F_DATE_LONG
+                                || f == F_SUMMARY || f == F_SLUG
+                                || (f == F_EXCERPT && cc->c->md_pre_json)) {
+                                Instr *ins = comp_emit(cc, OP_PAGE_STR);
+                                ins->a = f; ins->b = esc;
+                                break;
+                            }
+                            if (f == F_CONTENT && cc->c->md_pre_json && !cc->is_card_mode) {
+                                Instr *ins = comp_emit(cc, OP_PAGE_CONTENT);
+                                ins->b = esc;
+                                break;
+                            }
+                            if (f == F_READING_MINUTES) {
+                                Instr *ins = comp_emit(cc, OP_PAGE_INT);
+                                ins->a = f;
+                                break;
+                            }
+                        }
+                    } else if (rf->chain_len == 2 && !cc->is_card_mode
+                               && (rf->chain[0] == F_NEWER || rf->chain[0] == F_OLDER)) {
+                        uint8_t f2 = rf->chain[1];
+                        if (f2 == F_TITLE || f2 == F_URL || f2 == F_DATE || f2 == F_DATE_LONG) {
+                            Instr *ins = comp_emit(cc, OP_PAGE_LINK_STR);
+                            ins->a = rf->chain[0]; ins->b = f2; ins->c = esc;
+                            break;
+                        }
+                    }
+                } else if (rf->kind == REF_ROOT && rf->root_field == RF_TAG && rf->chain_len == 1) {
+                    uint8_t f = rf->chain[0];
+                    if (f == F_NAME || f == F_SLUG || f == F_URL) {
+                        Instr *ins = comp_emit(cc, OP_TAG_STR);
+                        ins->a = f; ins->b = esc;
+                        break;
+                    }
+                    if (f == F_COUNT) {
+                        Instr *ins = comp_emit(cc, OP_TAG_INT);
+                        ins->a = f;
+                        break;
+                    }
+                } else if (rf->kind == REF_ROOT && rf->root_field == RF_PAGER && rf->chain_len == 1) {
+                    uint8_t f = rf->chain[0];
+                    if (f == F_URL || f == F_NEWER_URL || f == F_OLDER_URL) {
+                        Instr *ins = comp_emit(cc, OP_PAGER_STR);
+                        ins->a = f; ins->b = esc;
+                        break;
+                    }
+                    if (f == F_NUMBER || f == F_TOTAL) {
+                        Instr *ins = comp_emit(cc, OP_PAGER_INT);
+                        ins->a = f;
+                        break;
+                    }
+                } else if (rf->kind == REF_SCOPE && rf->chain_len == 1) {
+                    int slot = comp_find_scope(cc, rf);
+                    if (slot >= 0) {
+                        uint8_t f = rf->chain[0];
+                        if (rf->is_loop) {
+                            if (f == F_INDEX || f == F_LENGTH) {
+                                Instr *ins = comp_emit(cc, OP_SCOPE_INT);
+                                ins->a = (uint8_t)slot; ins->b = f; ins->c = K_LOOP;
+                                break;
+                            }
+                        } else {
+                            uint8_t ok = cc->loops[slot].obj_kind;
+                            if ((ok == O_TAGREF && (f == F_NAME || f == F_SLUG || f == F_URL))
+                                || (ok == O_TAGSUM && (f == F_NAME || f == F_SLUG || f == F_URL))
+                                || (ok == O_TOC && (f == F_ID || (f == F_HTML && cc->c->md_pre_json)))
+                                || (ok == O_CARD && (f == F_TITLE || f == F_URL || f == F_DATE || f == F_DATE_LONG
+                                                     || f == F_SUMMARY || (f == F_EXCERPT && cc->c->md_pre_json)))) {
+                                Instr *ins = comp_emit(cc, OP_SCOPE_STR);
+                                ins->a = (uint8_t)slot; ins->b = f; ins->c = ok; ins->len = esc;
+                                break;
+                            }
+                            if ((ok == O_TOC && f == F_LEVEL)
+                                || (ok == O_TAGSUM && f == F_COUNT)
+                                || (ok == O_CARD && f == F_READING_MINUTES)) {
+                                Instr *ins = comp_emit(cc, OP_SCOPE_INT);
+                                ins->a = (uint8_t)slot; ins->b = f; ins->c = ok;
+                                break;
+                            }
+                        }
+                    }
+                }
+                comp_mark_scopes(cc);
+                Instr *ins = comp_emit(cc, OP_VAR_GEN);
+                ins->node = seg;
+                break;
+            }
+            case ND_IF: {
+                Ref *rf = &seg->u.nif.ref;
+                uint32_t jpc = (uint32_t)cc->code->len;
+                bool spec = false;
+                if (ref_is_page_obj(cc, rf)) {
+                    if (rf->chain_len == 0 && !cc->is_card_mode) {
+                        Instr *ins = comp_emit(cc, OP_IF_PAGE_JMP);
+                        ins->a = 0xff; ins->b = seg->neg; spec = true;
+                    } else if (rf->chain_len == 1) {
+                        uint8_t f = rf->chain[0];
+                        if ((!cc->is_card_mode || is_card_field_ok(f))
+                            && (f == F_DATE || f == F_TAGS || f == F_TOC || f == F_NEWER || f == F_OLDER
+                                || f == F_SUMMARY || f == F_TITLE || f == F_IS_POST || f == F_EXCERPT)) {
+                            Instr *ins = comp_emit(cc, OP_IF_PAGE_JMP);
+                            ins->a = f; ins->b = seg->neg; spec = true;
+                        }
+                    }
+                } else if (rf->kind == REF_ROOT && rf->root_field == RF_TAG) {
+                    if (rf->chain_len == 0) {
+                        Instr *ins = comp_emit(cc, OP_IF_TAG_JMP);
+                        ins->a = 0xff; ins->b = seg->neg; spec = true;
+                    } else if (rf->chain_len == 1 && (rf->chain[0] == F_POSTS || rf->chain[0] == F_NAME)) {
+                        Instr *ins = comp_emit(cc, OP_IF_TAG_JMP);
+                        ins->a = rf->chain[0]; ins->b = seg->neg; spec = true;
+                    }
+                } else if (rf->kind == REF_ROOT && rf->root_field == RF_PAGER && rf->chain_len == 1
+                           && (rf->chain[0] == F_NEWER_URL || rf->chain[0] == F_OLDER_URL || rf->chain[0] == F_URL)) {
+                    Instr *ins = comp_emit(cc, OP_IF_PAGER_JMP);
+                    ins->a = rf->chain[0]; ins->b = seg->neg; spec = true;
+                } else if (rf->kind == REF_SCOPE && rf->chain_len == 1) {
+                    int slot = comp_find_scope(cc, rf);
+                    if (slot >= 0) {
+                        uint8_t f = rf->chain[0];
+                        if (rf->is_loop && (f == F_FIRST || f == F_LAST || f == F_INDEX)) {
+                            Instr *ins = comp_emit(cc, OP_IF_LOOP_JMP);
+                            ins->a = (uint8_t)slot; ins->b = f; ins->c = seg->neg; spec = true;
+                        } else if (!rf->is_loop) {
+                            uint8_t ok = cc->loops[slot].obj_kind;
+                            if ((ok == O_TAGREF && (f == F_URL || f == F_NAME))
+                                || (ok == O_CARD && (f == F_SUMMARY || f == F_DATE || f == F_TAGS))) {
+                                Instr *ins = comp_emit(cc, OP_IF_SCOPE_JMP);
+                                ins->a = (uint8_t)slot; ins->b = f; ins->c = ok; ins->len = seg->neg; spec = true;
+                            }
+                        }
+                    }
+                }
+                if (!spec) {
+                    comp_mark_scopes(cc);
+                    Instr *ins = comp_emit(cc, OP_IF_GEN_JMP);
+                    ins->node = seg;
+                }
+                comp_nodes(cc, &seg->u.nif.then_nodes);
+                if (seg->has_else) {
+                    uint32_t ejpc = (uint32_t)cc->code->len;
+                    comp_emit(cc, OP_JMP);
+                    ((Instr *)arr_at(cc->code, jpc))->off = (uint32_t)cc->code->len;
+                    comp_nodes(cc, &seg->u.nif.else_nodes);
+                    ((Instr *)arr_at(cc->code, ejpc))->off = (uint32_t)cc->code->len;
+                } else {
+                    ((Instr *)arr_at(cc->code, jpc))->off = (uint32_t)cc->code->len;
+                }
+                break;
+            }
+            case ND_FOR: {
+                if (cc->ldepth >= 8) {
+                    comp_mark_scopes(cc);
+                    /* Rare deep nesting: wrap as generic */
+                    Instr *ins = comp_emit(cc, OP_INCLUDE_GEN);
+                    ins->node = seg;
+                    break;
+                }
+                Ref *rf = &seg->u.nfor.ref;
+                uint8_t lkind = FL_GEN;
+                uint8_t okind = 0xff;
+                if (ref_is_page_obj(cc, rf) && rf->chain_len == 1) {
+                    if (rf->chain[0] == F_TAGS) { lkind = FL_PAGE_TAGS; okind = O_TAGREF; }
+                    else if (rf->chain[0] == F_TOC && !cc->is_card_mode) { lkind = FL_PAGE_TOC; okind = O_TOC; }
+                } else if (rf->kind == REF_ROOT) {
+                    if (rf->root_field == RF_POSTS && rf->chain_len == 0) { lkind = FL_POSTS; okind = O_CARD; }
+                    else if (rf->root_field == RF_TAG && rf->chain_len == 1 && rf->chain[0] == F_POSTS) { lkind = FL_TAG_POSTS; okind = O_CARD; }
+                    else if (rf->root_field == RF_TAGS && rf->chain_len == 0) { lkind = FL_TAGS; okind = O_TAGSUM; }
+                    else if (rf->root_field == RF_RECENT && rf->chain_len == 0) { lkind = FL_RECENT; okind = O_CARD; }
+                }
+                if (lkind == FL_GEN) comp_mark_scopes(cc);
+                int slot = cc->ldepth++;
+                uint32_t bpc = (uint32_t)cc->code->len;
+                cc->loops[slot].binder = seg->u.nfor.binder;
+                cc->loops[slot].obj_kind = okind;
+                cc->loops[slot].begin_pc = bpc;
+                cc->loops[slot].need_scope = false;
+                Instr *beg = comp_emit(cc, OP_FOR_BEGIN);
+                beg->a = (uint8_t)slot;
+                beg->b = lkind;
+                beg->node = seg;
+                uint32_t body_pc = (uint32_t)cc->code->len;
+                comp_nodes(cc, &seg->u.nfor.body);
+                bool ns = cc->loops[slot].need_scope;
+                cc->ldepth--;
+                Instr *nxt = comp_emit(cc, OP_FOR_NEXT);
+                nxt->a = (uint8_t)slot;
+                nxt->c = ns ? 1 : 0;
+                nxt->off = body_pc;
+                Instr *beg_fix = arr_at(cc->code, bpc);
+                beg_fix->c = ns ? 1 : 0;
+                beg_fix->off = (uint32_t)cc->code->len;
+                break;
+            }
+            case ND_INCLUDE: {
+                if (seg->u.ninc.tpl_idx >= 0 && seg->u.ninc.depth_add == 0 && cc->c->tpl_card_cache) {
+                    Tpl *u = arr_at(cc->templates, (size_t)seg->u.ninc.tpl_idx);
+                    if (u->cache_mode == 2 && cc->ldepth > 0) {
+                        /* Check if innermost matching binder is an O_CARD loop */
+                        for (int s = cc->ldepth - 1; s >= 0; s--) {
+                            if (cc->loops[s].binder.len == u->dyn_name.len
+                                && eq_bytes(pool_at(cc->p, cc->loops[s].binder), pool_at(cc->p, u->dyn_name), u->dyn_name.len)) {
+                                if (cc->loops[s].obj_kind == O_CARD) {
+                                    Instr *ins = comp_emit(cc, OP_INCLUDE_CARD);
+                                    ins->a = (uint8_t)s;
+                                    ins->b = u->card_slot;
+                                    ins->off = (uint32_t)seg->u.ninc.tpl_idx;
+                                    ins->node = seg;
+                                    goto inc_done;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                comp_mark_scopes(cc);
+                {
+                    Instr *ins = comp_emit(cc, OP_INCLUDE_GEN);
+                    ins->node = seg;
+                }
+            inc_done:
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+static void tpl_compile_into(Ctx *c, Arr *templates, Arr *nodes, Arr *code_out, bool is_card_mode, Sp card_dyn) {
+    arr_new(code_out, sizeof(Instr));
+    CompCtx cc;
+    cc.c = c;
+    cc.p = c->pool;
+    cc.templates = templates;
+    cc.code = code_out;
+    cc.is_card_mode = is_card_mode;
+    cc.card_dyn = card_dyn;
+    cc.ldepth = 0;
+    comp_nodes(&cc, nodes);
+}
+
+typedef struct {
+    uint8_t akind;
+    uint32_t idx;
+    uint32_t i;
+    uint32_t len;
+    uint32_t start; /* for Range arrays */
+    const uint32_t *card_ptr; /* for A_CARDS */
+    Sp binder;
+} VmLoop;
+
+#define VM_EMIT_BYTES(src, slen) do { \
+    size_t _n = (slen); \
+    if (__builtin_expect(dst + _n <= dst_end, 1)) { \
+        copy_fast(dst, (src), _n); \
+        dst += _n; \
+    } else { \
+        out->len = (size_t)(dst - out->base); \
+        pool_put_slow(out, (src), _n); \
+        dst = out->base + out->len; \
+    } \
+} while (0)
+
+#define VM_EMIT_STR(sp, is_clean, do_esc) do { \
+    Sp _sp = (sp); \
+    if (__builtin_expect((is_clean), 1)) { \
+        VM_EMIT_BYTES(pbase + _sp.off, _sp.len); \
+    } else { \
+        out->len = (size_t)(dst - out->base); \
+        if (do_esc) html_json_escape_into(out, pbase + _sp.off, _sp.len); \
+        else json_escape_into(out, pbase + _sp.off, _sp.len); \
+        dst = out->base + out->len; \
+    } \
+} while (0)
+
+#define VM_EMIT_INT(val_i64) do { \
+    int64_t _iv = (val_i64); \
+    if (__builtin_expect(_iv >= 0 && _iv < 10 && dst < dst_end, 1)) { \
+        *dst++ = (uint8_t)('0' + _iv); \
+    } else if (__builtin_expect(_iv >= 10 && _iv < 100 && dst + 2 <= dst_end, 1)) { \
+        dst[0] = (uint8_t)('0' + _iv / 10); \
+        dst[1] = (uint8_t)('0' + _iv % 10); \
+        dst += 2; \
+    } else { \
+        out->len = (size_t)(dst - out->base); \
+        pool_i64(out, _iv); \
+        dst = out->base + out->len; \
+    } \
+} while (0)
+
+static void tpl_exec_code(Ctx *c, Arr *templates, Arr *code, Page *cur_page,
+                          Scope *scopes, size_t *nscopes, Pool *out, Str *scratch, uint32_t depth) {
+    Instr *ins_arr = (Instr *)code->items;
+    size_t nins = code->len;
+    const uint8_t *pbase = c->pool->base;
+    uint8_t *dst = out->base + out->len;
+    uint8_t *dst_end = out->base + out->cap;
+    Scope *root = &scopes[0];
+    Page *pages = (Page *)c->pages.items;
+    Tag *tags = (Tag *)c->tags.items;
+    Tag *cur_tag = (root->tag >= 0) ? &tags[root->tag] : 0;
+    Pager *cur_pager = (root->pager >= 0) ? (Pager *)c->pagers.items + root->pager : 0;
+    TagRef *tagrefs = (TagRef *)c->tagref_store.items;
+    Range *tagref_ranges = (Range *)c->tagref_arrays.items;
+    Toc *tocs_lazy = (Toc *)c->cur_toc->items;
+    Toc *tocs_store = (Toc *)c->toc_store.items;
+    Range *toc_ranges = (Range *)c->toc_arrays.items;
+    VmLoop loops[8];
+
+    size_t pc = 0;
+    while (pc < nins) {
+        Instr *ins = &ins_arr[pc++];
+        switch (ins->op) {
+            case OP_TEXT:
+                VM_EMIT_BYTES(pbase + ins->off, ins->len);
+                break;
+            case OP_PAGE_STR: {
+                if (__builtin_expect(!cur_page, 0)) break;
+                switch (ins->a) {
+                    case F_TITLE:     VM_EMIT_STR(cur_page->title, (cur_page->clean_mask & 1), ins->b); break;
+                    case F_URL:       VM_EMIT_STR(cur_page->url, (cur_page->clean_mask & 2), ins->b); break;
+                    case F_DATE:      VM_EMIT_BYTES(pbase + cur_page->date.off, cur_page->date.len); break;
+                    case F_DATE_LONG: VM_EMIT_BYTES(pbase + cur_page->date_long.off, cur_page->date_long.len); break;
+                    case F_SUMMARY:   VM_EMIT_STR(cur_page->summary, (cur_page->clean_mask & 4), ins->b); break;
+                    case F_SLUG:      VM_EMIT_BYTES(pbase + cur_page->slug.off, cur_page->slug.len); break;
+                    case F_EXCERPT:   VM_EMIT_BYTES(pbase + cur_page->excerpt.off, cur_page->excerpt.len); break;
+                    default: break;
+                }
+                break;
+            }
+            case OP_PAGE_CONTENT: {
+                if (__builtin_expect(!cur_page, 0)) break;
+                if (c->lazy_md) {
+                    VM_EMIT_BYTES(c->cur_html, c->cur_html_len);
+                } else {
+                    VM_EMIT_BYTES(pbase + cur_page->html.off, cur_page->html.len);
+                }
+                break;
+            }
+            case OP_PAGE_INT: {
+                if (__builtin_expect(!cur_page, 0)) break;
+                VM_EMIT_INT(cur_page->reading_minutes);
+                break;
+            }
+            case OP_PAGE_LINK_STR: {
+                if (__builtin_expect(!cur_page, 0)) break;
+                int32_t li = (ins->a == F_NEWER) ? cur_page->newer : cur_page->older;
+                if (__builtin_expect(li < 0, 0)) break;
+                Page *lp = &pages[li];
+                switch (ins->b) {
+                    case F_TITLE:     VM_EMIT_STR(lp->title, (lp->clean_mask & 1), ins->c); break;
+                    case F_URL:       VM_EMIT_STR(lp->url, (lp->clean_mask & 2), ins->c); break;
+                    case F_DATE:      VM_EMIT_BYTES(pbase + lp->date.off, lp->date.len); break;
+                    case F_DATE_LONG: VM_EMIT_BYTES(pbase + lp->date_long.off, lp->date_long.len); break;
+                    default: break;
+                }
+                break;
+            }
+            case OP_IF_PAGE_JMP: {
+                bool truth = false;
+                if (cur_page) {
+                    switch (ins->a) {
+                        case 0xff:      truth = true; break;
+                        case F_DATE:    truth = cur_page->date.len > 0; break;
+                        case F_TAGS:    truth = tagref_ranges[cur_page->tags].len > 0; break;
+                        case F_TOC:     truth = c->lazy_md ? (c->cur_toc->len > 0) : (toc_ranges[cur_page->toc].len > 0); break;
+                        case F_NEWER:   truth = cur_page->newer >= 0; break;
+                        case F_OLDER:   truth = cur_page->older >= 0; break;
+                        case F_SUMMARY: truth = cur_page->summary.len > 0; break;
+                        case F_TITLE:   truth = cur_page->title.len > 0; break;
+                        case F_IS_POST: truth = cur_page->is_post; break;
+                        case F_EXCERPT: truth = cur_page->excerpt.len > 0; break;
+                        default: break;
+                    }
+                }
+                if (truth == (bool)ins->b) pc = ins->off;
+                break;
+            }
+            case OP_TAG_STR: {
+                if (__builtin_expect(!cur_tag, 0)) break;
+                if (ins->a == F_NAME) VM_EMIT_STR(cur_tag->name, (cur_tag->clean_mask & 1), ins->b);
+                else if (ins->a == F_URL) VM_EMIT_STR(cur_tag->url, (cur_tag->clean_mask & 2), ins->b);
+                else VM_EMIT_BYTES(pbase + cur_tag->slug.off, cur_tag->slug.len);
+                break;
+            }
+            case OP_TAG_INT: {
+                if (__builtin_expect(!cur_tag, 0)) break;
+                VM_EMIT_INT((int64_t)cur_tag->posts.len);
+                break;
+            }
+            case OP_IF_TAG_JMP: {
+                bool truth = false;
+                if (cur_tag) {
+                    if (ins->a == 0xff) truth = true;
+                    else if (ins->a == F_POSTS) truth = cur_tag->posts.len > 0;
+                    else if (ins->a == F_NAME) truth = cur_tag->name.len > 0;
+                }
+                if (truth == (bool)ins->b) pc = ins->off;
+                break;
+            }
+            case OP_PAGER_STR: {
+                if (__builtin_expect(!cur_pager, 0)) break;
+                Sp s = (ins->a == F_URL) ? cur_pager->url : (ins->a == F_NEWER_URL ? cur_pager->newer_url : cur_pager->older_url);
+                VM_EMIT_STR(s, c->site_base_clean, ins->b);
+                break;
+            }
+            case OP_PAGER_INT: {
+                if (__builtin_expect(!cur_pager, 0)) break;
+                VM_EMIT_INT(ins->a == F_NUMBER ? cur_pager->number : cur_pager->total);
+                break;
+            }
+            case OP_IF_PAGER_JMP: {
+                bool truth = false;
+                if (cur_pager) {
+                    Sp s = (ins->a == F_NEWER_URL) ? cur_pager->newer_url : (ins->a == F_OLDER_URL ? cur_pager->older_url : cur_pager->url);
+                    truth = s.len > 0;
+                }
+                if (truth == (bool)ins->b) pc = ins->off;
+                break;
+            }
+            case OP_SCOPE_STR: {
+                VmLoop *lp = &loops[ins->a];
+                uint8_t esc = (uint8_t)ins->len;
+                switch (ins->c) {
+                    case O_TAGREF: {
+                        TagRef *r = &tagrefs[lp->start + lp->i];
+                        if (ins->b == F_NAME) VM_EMIT_STR(r->name, (r->clean_mask & 1), esc);
+                        else if (ins->b == F_URL) VM_EMIT_STR(r->url, (r->clean_mask & 2), esc);
+                        else VM_EMIT_BYTES(pbase + r->slug.off, r->slug.len);
+                        break;
+                    }
+                    case O_TOC: {
+                        Toc *t = c->lazy_md ? &tocs_lazy[lp->i] : &tocs_store[lp->start + lp->i];
+                        if (ins->b == F_ID) {
+                            VM_EMIT_BYTES(pbase + t->id.off, t->id.len);
+                        } else {
+                            if (c->lazy_md) VM_EMIT_BYTES(c->cur_html + t->html.off, t->html.len);
+                            else VM_EMIT_BYTES(pbase + t->html.off, t->html.len);
+                        }
+                        break;
+                    }
+                    case O_TAGSUM: {
+                        Tag *t = &tags[lp->i];
+                        if (ins->b == F_NAME) VM_EMIT_STR(t->name, (t->clean_mask & 1), esc);
+                        else if (ins->b == F_URL) VM_EMIT_STR(t->url, (t->clean_mask & 2), esc);
+                        else VM_EMIT_BYTES(pbase + t->slug.off, t->slug.len);
+                        break;
+                    }
+                    case O_CARD: {
+                        Page *pg = &pages[lp->card_ptr[lp->i]];
+                        switch (ins->b) {
+                            case F_TITLE:     VM_EMIT_STR(pg->title, (pg->clean_mask & 1), esc); break;
+                            case F_URL:       VM_EMIT_STR(pg->url, (pg->clean_mask & 2), esc); break;
+                            case F_DATE:      VM_EMIT_BYTES(pbase + pg->date.off, pg->date.len); break;
+                            case F_DATE_LONG: VM_EMIT_BYTES(pbase + pg->date_long.off, pg->date_long.len); break;
+                            case F_SUMMARY:   VM_EMIT_STR(pg->summary, (pg->clean_mask & 4), esc); break;
+                            case F_EXCERPT:   VM_EMIT_BYTES(pbase + pg->excerpt.off, pg->excerpt.len); break;
+                            default: break;
+                        }
+                        break;
+                    }
+                    default: break;
+                }
+                break;
+            }
+            case OP_SCOPE_INT: {
+                VmLoop *lp = &loops[ins->a];
+                if (ins->c == K_LOOP) {
+                    VM_EMIT_INT(ins->b == F_INDEX ? (int64_t)(lp->i + 1) : (int64_t)lp->len);
+                } else if (ins->c == O_TOC) {
+                    Toc *t = c->lazy_md ? &tocs_lazy[lp->i] : &tocs_store[lp->start + lp->i];
+                    VM_EMIT_INT(t->level);
+                } else if (ins->c == O_TAGSUM) {
+                    VM_EMIT_INT((int64_t)tags[lp->i].posts.len);
+                } else if (ins->c == O_CARD) {
+                    VM_EMIT_INT(pages[lp->card_ptr[lp->i]].reading_minutes);
+                }
+                break;
+            }
+            case OP_IF_SCOPE_JMP: {
+                VmLoop *lp = &loops[ins->a];
+                bool truth = false;
+                if (ins->c == O_TAGREF) {
+                    TagRef *r = &tagrefs[lp->start + lp->i];
+                    truth = (ins->b == F_URL) ? (r->url.len > 0) : (r->name.len > 0);
+                } else if (ins->c == O_CARD) {
+                    Page *pg = &pages[lp->card_ptr[lp->i]];
+                    if (ins->b == F_SUMMARY) truth = pg->summary.len > 0;
+                    else if (ins->b == F_DATE) truth = pg->date.len > 0;
+                    else if (ins->b == F_TAGS) truth = tagref_ranges[pg->tags].len > 0;
+                }
+                if (truth == (bool)ins->len) pc = ins->off;
+                break;
+            }
+            case OP_IF_LOOP_JMP: {
+                VmLoop *lp = &loops[ins->a];
+                bool truth = (ins->b == F_FIRST) ? (lp->i == 0)
+                           : (ins->b == F_LAST)  ? (lp->i + 1 == lp->len)
+                           : true;
+                if (truth == (bool)ins->c) pc = ins->off;
+                break;
+            }
+            case OP_JMP:
+                pc = ins->off;
+                break;
+            case OP_FOR_BEGIN: {
+                VmLoop *lp = &loops[ins->a];
+                lp->i = 0;
+                lp->len = 0;
+                lp->start = 0;
+                lp->card_ptr = 0;
+                lp->binder = ins->node->u.nfor.binder;
+                switch (ins->b) {
+                    case FL_PAGE_TAGS:
+                        if (cur_page) {
+                            Range *r = &tagref_ranges[cur_page->tags];
+                            lp->akind = A_TAGREFS; lp->idx = cur_page->tags;
+                            lp->start = r->start; lp->len = r->len;
+                        }
+                        break;
+                    case FL_PAGE_TOC:
+                        if (cur_page) {
+                            lp->akind = A_TOC; lp->idx = cur_page->toc;
+                            if (c->lazy_md) { lp->start = 0; lp->len = (uint32_t)c->cur_toc->len; }
+                            else { Range *r = &toc_ranges[cur_page->toc]; lp->start = r->start; lp->len = r->len; }
+                        }
+                        break;
+                    case FL_POSTS:
+                        if (root->posts >= 0) {
+                            Arr *ca = arr_at(&c->card_arrays, (size_t)root->posts);
+                            lp->akind = A_CARDS; lp->idx = (uint32_t)root->posts;
+                            lp->card_ptr = (const uint32_t *)ca->items; lp->len = (uint32_t)ca->len;
+                        }
+                        break;
+                    case FL_TAG_POSTS:
+                        if (cur_tag) {
+                            lp->akind = A_CARDS; lp->idx = 1 + (uint32_t)root->tag;
+                            lp->card_ptr = (const uint32_t *)cur_tag->posts.items; lp->len = (uint32_t)cur_tag->posts.len;
+                        }
+                        break;
+                    case FL_TAGS:
+                        lp->akind = A_TAGSUMS; lp->idx = 0;
+                        lp->len = (uint32_t)c->tags.len;
+                        break;
+                    case FL_RECENT: {
+                        Arr *ca = arr_at(&c->card_arrays, 0);
+                        lp->akind = A_CARDS; lp->idx = 0;
+                        lp->card_ptr = (const uint32_t *)ca->items; lp->len = (uint32_t)ca->len;
+                        break;
+                    }
+                    default: {
+                        Val v = tpl_eval(c, scopes, *nscopes, &ins->node->u.nfor.ref);
+                        if (v.kind == K_ARR) {
+                            lp->akind = v.akind; lp->idx = v.idx;
+                            lp->len = (uint32_t)ctx_arr_len(c, v.akind, v.idx);
+                            if (v.akind == A_CARDS) lp->card_ptr = (const uint32_t *)((Arr *)arr_at(&c->card_arrays, v.idx))->items;
+                            else if (v.akind == A_TAGREFS) lp->start = tagref_ranges[v.idx].start;
+                            else if (v.akind == A_TOC && !c->lazy_md) lp->start = toc_ranges[v.idx].start;
+                        }
+                        break;
+                    }
+                }
+                if (lp->len == 0) {
+                    pc = ins->off;
+                } else if (ins->c) {
+                    Scope *fr = &scopes[(*nscopes)++];
+                    fr->is_root = false;
+                    fr->name = lp->binder;
+                    fr->value = ctx_arr_elem(c, lp->akind, lp->idx, 0);
+                    fr->lp = (LoopInfo){1, true, lp->len == 1, (int64_t)lp->len};
+                    fr->page = -1; fr->posts = -1; fr->pager = -1; fr->tag = -1;
+                }
+                break;
+            }
+            case OP_FOR_NEXT: {
+                VmLoop *lp = &loops[ins->a];
+                lp->i++;
+                if (lp->i < lp->len) {
+                    if (ins->c) {
+                        Scope *fr = &scopes[*nscopes - 1];
+                        fr->value = ctx_arr_elem(c, lp->akind, lp->idx, lp->i);
+                        fr->lp.index = (int64_t)lp->i + 1;
+                        fr->lp.first = false;
+                        fr->lp.last = (lp->i + 1 == lp->len);
+                    }
+                    pc = ins->off;
+                } else if (ins->c) {
+                    (*nscopes)--;
+                }
+                break;
+            }
+            case OP_INCLUDE_CARD: {
+                if (__builtin_expect(depth == 0, 1)) {
+                    uint32_t pidx = loops[ins->a].card_ptr[loops[ins->a].i];
+                    Sp *slot = &c->tpl_card_cache[(size_t)ins->b * c->pages.len + pidx];
+                    if (__builtin_expect(slot->off != 0xffffffffu, 1)) {
+                        VM_EMIT_BYTES(c->cache_pool->base + slot->off, slot->len);
+                    } else {
+                        Tpl *ct = arr_at(templates, ins->off);
+                        uint32_t st = pool_mark(c->cache_pool);
+                        if (ct->card_code.len > 0) {
+                            /* Fast flat bytecode execution for O_CARD directly into cache_pool! */
+                            Scope cframes[16];
+                            cframes[0] = scopes[0];
+                            cframes[1].is_root = false;
+                            cframes[1].name = ct->dyn_name;
+                            cframes[1].value = val_obj(O_CARD, pidx);
+                            cframes[1].lp = (LoopInfo){1, true, true, 1};
+                            cframes[1].page = -1; cframes[1].posts = -1; cframes[1].pager = -1; cframes[1].tag = -1;
+                            size_t cnf = 2;
+                            tpl_exec_code(c, templates, &ct->card_code, &pages[pidx], cframes, &cnf, c->cache_pool, scratch, 1);
+                        } else {
+                            Scope cframes[16];
+                            cframes[0] = scopes[0];
+                            cframes[1].is_root = false;
+                            cframes[1].name = ct->dyn_name;
+                            cframes[1].value = val_obj(O_CARD, pidx);
+                            cframes[1].lp = (LoopInfo){1, true, true, 1};
+                            cframes[1].page = -1; cframes[1].posts = -1; cframes[1].pager = -1; cframes[1].tag = -1;
+                            size_t cnf = 2;
+                            tpl_emit(c, templates, &ct->nodes, cframes, &cnf, c->cache_pool, scratch, 1);
+                        }
+                        *slot = pool_span(c->cache_pool, st);
+                        VM_EMIT_BYTES(c->cache_pool->base + slot->off, slot->len);
+                    }
+                    break;
+                }
+                /* depth > 0 fallback */
+                out->len = (size_t)(dst - out->base);
+                {
+                    Arr one = {ins->node, 1, 1, sizeof(Node)};
+                    tpl_emit(c, templates, &one, scopes, nscopes, out, scratch, depth);
+                }
+                dst = out->base + out->len;
+                break;
+            }
+            case OP_VAR_GEN: {
+                out->len = (size_t)(dst - out->base);
+                Val v = tpl_eval(c, scopes, *nscopes, &ins->node->u.var.ref);
+                if (__builtin_expect(v.kind == K_STR_JSON, 1)) {
+                    pool_put(out, pbase + v.v.s.off, v.v.s.len);
+                } else if (v.kind == K_CUR_HTML) {
+                    pool_put(out, c->cur_html + v.v.s.off, v.v.s.len);
+                } else {
+                    val_write(c, v, out, !ins->node->raw, scratch);
+                }
+                dst = out->base + out->len;
+                break;
+            }
+            case OP_IF_GEN_JMP: {
+                Val v = tpl_eval(c, scopes, *nscopes, &ins->node->u.nif.ref);
+                bool t = val_true(c, v);
+                if (t == (bool)ins->node->neg) pc = ins->off;
+                break;
+            }
+            case OP_INCLUDE_GEN: {
+                out->len = (size_t)(dst - out->base);
+                Arr one = {ins->node, 1, 1, sizeof(Node)};
+                tpl_emit(c, templates, &one, scopes, nscopes, out, scratch, depth);
+                dst = out->base + out->len;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    out->len = (size_t)(dst - out->base);
+}
+
+void tpl_run(Ctx *c, Arr *templates, Tpl *tpl, Scope *scopes, size_t *nscopes,
+             Pool *out, Str *scratch, uint32_t depth) {
+    if (__builtin_expect(tpl->code.len > 0, 1)) {
+        Page *cur_page = (scopes[0].page >= 0) ? (Page *)c->pages.items + scopes[0].page : 0;
+        tpl_exec_code(c, templates, &tpl->code, cur_page, scopes, nscopes, out, scratch, depth);
+        return;
+    }
+    tpl_emit(c, templates, &tpl->nodes, scopes, nscopes, out, scratch, depth);
+}
+
+void tpl_optimize(Ctx *c, Arr *templates) {
+    Pool *p = c->pool;
+    Arr orig_nodes;
+    arr_new(&orig_nodes, sizeof(Arr));
+    for (size_t k = 0; k < templates->len; k++) {
+        Tpl *t = arr_at(templates, k);
+        Arr *slot = arr_slot(&orig_nodes, p);
+        *slot = t->nodes;
+        arr_new(&t->code, sizeof(Instr));
+        arr_new(&t->card_code, sizeof(Instr));
+    }
+    static Str opt_scratch;
+    str_clear(&opt_scratch);
+    /* Optimize & compile entry templates and cache_mode==2 card templates. */
+    for (size_t k = 0; k < templates->len; k++) {
+        Tpl *t = arr_at(templates, k);
+        if (t->cache_mode == 1) continue; /* pre-rendered via tpl_global */
+        Arr opt;
+        arr_new(&opt, sizeof(Node));
+        uint32_t budget = 256;
+        Arr *src = arr_at(&orig_nodes, k);
+        opt_nodes(c, templates, &orig_nodes, src, &opt, 0, &opt_scratch, &budget,
+                  t->cache_mode == 2, t->dyn_name);
+        t->nodes = opt;
+        if (t->cache_mode == 2) {
+            tpl_compile_into(c, templates, &t->nodes, &t->card_code, true, t->dyn_name);
+        }
+        tpl_compile_into(c, templates, &t->nodes, &t->code, false, SP_NONE);
     }
 }

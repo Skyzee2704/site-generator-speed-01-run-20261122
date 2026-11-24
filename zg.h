@@ -51,7 +51,14 @@ int memcmp(const void *a, const void *b, size_t n);
 static inline void copy_fast(void *d, const void *s, size_t n) {
     uint8_t *dd = (uint8_t *)d;
     const uint8_t *ss = (const uint8_t *)s;
-    if (__builtin_expect(n <= 16, 1)) {
+    if (__builtin_expect(n <= 32, 1)) {
+        if (n >= 16) {
+            __m128i v0 = _mm_loadu_si128((const __m128i *)ss);
+            __m128i v1 = _mm_loadu_si128((const __m128i *)(ss + n - 16));
+            _mm_storeu_si128((__m128i *)dd, v0);
+            _mm_storeu_si128((__m128i *)(dd + n - 16), v1);
+            return;
+        }
         if (n >= 8) {
             uint64_t a, b;
             __builtin_memcpy(&a, ss, 8);
@@ -228,6 +235,7 @@ bool u_is_space(uint32_t cp);
 int u16_cmp(const uint8_t *a, size_t an, const uint8_t *b, size_t bn);
 uint32_t nfkd_find(uint32_t cp, uint32_t *out);
 Sp slug_make(Pool *p, Sp text, Dict *cache);
+Sp slug_make_fast(Pool *p, Sp text, Dict *non_ascii_cache);
 Sp slug_unique(Pool *p, Sp slug, Set *taken);
 size_t word_count(const uint8_t *b, size_t n);
 Sp date_long(Pool *p, Sp d);
@@ -235,40 +243,42 @@ void json_escape_into(Pool *p, const uint8_t *b, size_t n);
 void html_json_escape_into(Pool *p, const uint8_t *b, size_t n);
 
 /* ---------------- string dict / set ---------------- */
-struct Dict { Arr keys; Arr vals; Arr used; size_t mask; size_t len; };
-struct Set { Arr keys; Arr used; size_t mask; size_t len; };
+typedef struct { uint32_t h32; Sp key; Sp val; } DictEnt;
+typedef struct { uint32_t h32; Sp key; } SetEnt;
+struct Dict { DictEnt *ents; size_t mask; size_t len; };
+struct Set { SetEnt *ents; size_t mask; size_t len; };
 void dict_new(Dict *d);
+void dict_reserve(Dict *d, Pool *p, size_t expect);
 bool dict_get(Dict *d, Pool *p, const uint8_t *key, size_t klen, Sp *out);
 void dict_put(Dict *d, Pool *p, Sp key, Sp val);
 bool dict_has(Dict *d, Pool *p, const uint8_t *key, size_t klen);
 void set_new(Set *s);
+void set_reserve(Set *s, Pool *p, size_t expect);
 bool set_add(Set *s, Pool *p, Sp val);
 bool set_has(Set *s, Pool *p, const uint8_t *key, size_t klen);
 
 /* ---------------- JSON input ---------------- */
-enum RawFileFlags {
-    RF_HAS_CR    = 1 << 0,
-    RF_CRLF_NORM = 1 << 1,
-    RF_HAS_FM    = 1 << 2,
-    RF_HAS_WC    = 1 << 3,
-    RF_NO_ESC    = 1 << 4
+enum FileFlags {
+    FF_HAS_CR   = 1 << 0,
+    FF_CRLF_OK  = 1 << 1, /* already CRLF-normalized */
+    FF_HAS_FM   = 1 << 2, /* fm_close_off & body_rel_off valid */
+    FF_HAS_WC   = 1 << 3  /* word_cnt valid */
 };
-typedef struct { Sp a; Sp b; uint8_t has_cr; } SpPair;
 typedef struct {
-    Sp path;
-    Sp content;
+    Sp a;
+    Sp b;
     uint32_t fm_close_off;
     uint32_t body_rel_off;
     uint32_t word_cnt;
     uint8_t flags;
-} RawFile;
+} SpPair;
 typedef struct {
     Sp title; Sp base_url; int64_t per_page; int64_t recent;
 } Site;
 typedef struct {
     Site site;
     Arr templates; /* SpPair */
-    Arr files;     /* RawFile */
+    Arr files;     /* SpPair */
 } CaseInput;
 
 typedef struct {
@@ -280,7 +290,7 @@ typedef struct {
 
 bool json_read_case(Cur *c, CaseInput *out);
 bool json_all_begin(Cur *c);
-int json_all_next(Cur *c, CaseInput *out);
+int json_all_next(Cur *c, CaseInput *out); /* 1=case, 0=end, -1=err */
 
 /* ---------------- front matter ---------------- */
 typedef struct {
@@ -304,7 +314,7 @@ typedef struct {
     uint16_t pad;
     uint32_t idx;     /* K_ARR / K_OBJ index; K_LOOP 1-based index */
     union {
-        Sp s;         /* K_STR / K_STR_JSON / K_CUR_HTML / K_CUR_HTML_RAW */
+        Sp s;         /* K_STR / K_STR_JSON */
         int64_t n;    /* K_INT / K_BOOL */
         uint64_t u;   /* K_LOOP length / raw bits */
     } v;
@@ -348,8 +358,7 @@ typedef struct {
     int32_t older;     /* page index or -1 */
     bool is_post; uint8_t clean_mask; /* bit0=title, bit1=url, bit2=summary */
     int32_t layout_tpl;
-    Sp layout;
-    Sp body;
+    Sp layout; Sp body;
 } Page;
 
 typedef struct { Sp name; Sp slug; Sp url; Arr posts; /* u32 */ uint8_t clean_mask; /* bit0=name, bit1=url */ } Tag;
@@ -360,7 +369,7 @@ typedef struct { uint32_t start; uint32_t len; } Range;
 
 typedef struct {
     Pool *pool;
-    Pool *cache_pool;  /* dedicated pool for cached include bytes */
+    Pool *cache_pool; /* dedicated pool for cached include bytes */
     Sp site_title; Sp site_base;
     Arr pages;         /* Page */
     Arr post_order;    /* u32 */
@@ -421,14 +430,16 @@ struct Node {
         struct { Ref ref; } var; /* ND_VAR */
         struct { Ref ref; Arr then_nodes; Arr else_nodes; } nif; /* ND_IF */
         struct { Ref ref; Sp binder; Arr body; } nfor; /* ND_FOR */
-        struct { Sp name; int32_t tpl_idx; } ninc; /* ND_INCLUDE */
+        struct { Sp name; int32_t tpl_idx; uint8_t depth_add; } ninc; /* ND_INCLUDE */
     } u;
 };
 
 typedef struct {
     Sp name; Arr nodes; /* Node */ Arr needs; /* TplNeed */
+    Arr code;      /* compiled flat bytecode (Instr) */
+    Arr card_code; /* compiled flat bytecode specialized for O_CARD (cache_mode==2) */
     uint8_t cacheable; uint8_t storable; uint8_t cache_mode; uint8_t card_slot;
-    uint8_t uses_card_md; /* 1 if template (transitively) reads F_EXCERPT/F_READING_MINUTES via non-RF_PAGE */
+    uint8_t uses_card_excerpt;
     Sp dyn_name;
 } Tpl;
 
@@ -451,31 +462,39 @@ bool tpl_parse(Pool *p, Sp name, Sp src, Arr *nodes_out, Sp *err);
 void tpl_analyze(Pool *p, Arr *templates);
 bool tpl_can_pre_json_md(Arr *templates);
 void tpl_cache_open(Ctx *c, Pool *p, Arr *templates, size_t npages);
+void tpl_optimize(Ctx *c, Arr *templates);
 Val tpl_eval(Ctx *c, Scope *scopes, size_t nscopes, Ref *ref);
 void tpl_emit(Ctx *c, Arr *templates, Arr *nodes, Scope *scopes, size_t *nscopes,
               Pool *out, Str *scratch, uint32_t depth);
+void tpl_run(Ctx *c, Arr *templates, Tpl *tpl, Scope *scopes, size_t *nscopes,
+             Pool *out, Str *scratch, uint32_t depth);
 
 /* ---------------- markdown ---------------- */
 typedef struct {
     Page *pages; size_t npages;
-    RawFile *statics; size_t nstatics;
+    SpPair *statics; size_t nstatics;
     Dict *page_map;  /* path -> Sp{page_idx, 0} */
     Set *static_set; /* static paths (when nstatics > 0) */
     Sp base; Sp dir; Sp src_path;
     const uint8_t *dir_parts[64];
     size_t dir_plens[64];
+    size_t dir_prefix_len[65]; /* byte length of first k directory segments in env->dir */
     size_t dir_np;
+    bool base_clean;
+    bool dir_clean;
     Arr *broken; /* Sp, pool spans */
     Str *path_buf; /* reused scratch for resolve_path */
     Str *item_buf; /* reused scratch for the current list item's text */
     Str *item_scratch; /* reused scratch for accumulating a list item */
+    Str *out_str;
+    uint8_t *out_end;
 } LinkCtx;
-bool md_build_buf(Pool *p, const uint8_t *src, size_t src_len, LinkCtx *env, Dict *slug_cache,
-                  Str *scratch, Str *tmp, Str *text_tmp,
-                  Sp *html_out, Arr *toc_out, Sp *excerpt_out, bool json_esc, bool store_html_in_pool);
+bool md_build(Pool *p, Sp src, LinkCtx *env, Dict *slug_cache,
+              Str *scratch, Str *tmp, Str *text_tmp,
+              Sp *html_out, Arr *toc_out, Sp *excerpt_out, bool json_esc, bool store_html_in_pool);
 
 /* ---------------- build ---------------- */
-bool case_build(Pool *p, const uint8_t *in_base, CaseInput *c, Pool *out);
+bool case_build(Pool *p, CaseInput *c, Pool *out);
 bool cases_build(Pool *p, const uint8_t *input, size_t n, Pool *out);
 
 #endif
